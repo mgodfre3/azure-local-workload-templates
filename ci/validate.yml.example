@@ -1,3 +1,4 @@
+# Copy to .github/workflows/validate.yml with a workflow-authorized credential.
 name: Offline validation
 on:
   push:

@@ -127,7 +127,7 @@ Install-PSResource Pester -Version 5.7.1 -Scope CurrentUser -TrustRepository
 .\scripts\Test.ps1
 ```
 
-CI runs the same offline tests and Bicep compilation on Windows and Linux, plus shell syntax checks on Linux. Tests cover answer validation, image reuse/import decisions, collision protection, credential references, addressing, RBAC matching, bounded polling, guest disk-safety decisions and read-only modes. **No test creates Azure resources or asserts a successful live deployment.**
+[The optional GitHub Actions workflow](ci/validate.yml.example) runs the same offline tests and Bicep compilation on Windows and Linux, plus shell syntax checks on Linux. To activate it, copy it to `.github/workflows/validate.yml` and push with a credential authorized to write workflows. **Hosted CI has not run**; the workflow is provided as an opt-in example. Tests cover answer validation, image reuse/import decisions, collision protection, credential references, addressing, RBAC matching, bounded polling, guest disk-safety decisions and read-only modes. **No test creates Azure resources or asserts a successful live deployment.**
 
 Read [the public API and support references](docs/support.md) before extending the support matrix. Contributions should include focused offline tests and identify any live testing separately. See [CONTRIBUTING](CONTRIBUTING.md) and [SECURITY](SECURITY.md).
 
