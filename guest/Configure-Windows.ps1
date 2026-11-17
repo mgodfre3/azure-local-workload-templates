@@ -1,0 +1,415 @@
+[CmdletBinding()]
+param([Parameter(Mandatory = $true)][string]$ConfigurationBase64)
+
+function Assert-Keys($Object, $Keys) {
+    if ($null -eq $Object -or $Object -isnot [pscustomobject]) { throw 'Expected a JSON object.' }
+    foreach ($p in $Object.PSObject.Properties.Name) {
+        if ($p -cnotin $Keys) { throw 'Unsupported configuration property; secrets and product keys are not accepted.' }
+    }
+}
+
+function Get-CidrRange([string]$Cidr) {
+    if ($Cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/([1-9]|[12]\d|3[0-2])$') { throw 'Expected a non-universal IPv4 CIDR.' }
+    $ip, $prefix = $Cidr.Split('/')
+    [uint64]$n = 0
+    foreach ($octet in $ip.Split('.')) {
+        if ([int]$octet -gt 255 -or "$([int]$octet)" -cne $octet) { throw 'Invalid IPv4 address.' }
+        $n = $n * 256 + [int]$octet
+    }
+    [uint64]$length = [math]::Pow(2, 32 - [int]$prefix)
+    [uint64]$start = [math]::Floor($n / $length) * $length
+    if ($n -ne $start) { throw 'CIDR must use its network address.' }
+    return @($start, ($start + $length - 1))
+}
+
+function Assert-MediaUrl([string]$Url) {
+    $uri = $null
+    if (![uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https' -or
+        $uri.UserInfo -or $uri.Query -or $uri.Fragment -or !$uri.IsDefaultPort -or
+        $uri.DnsSafeHost -notmatch '\.' -or $uri.AbsolutePath -match '(?i)\.(exe|msi|zip)$') {
+        throw 'Media must be a public, direct HTTPS full ISO URL without credentials, query, or fragment.'
+    }
+    return $uri
+}
+
+function Read-WorkloadConfiguration([string]$Payload) {
+    try {
+        $bytes = [Convert]::FromBase64String($Payload)
+        $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $c = $utf8.GetString($bytes) | ConvertFrom-Json -ErrorAction Stop
+    } catch { throw 'ConfigurationBase64 must contain valid UTF8 JSON.' }
+    Assert-Keys $c @('profile', 'adminUsername', 'allowedCidrs', 'dataDiskSizeGB', 'fileServer', 'sqlServer')
+    if ($c.profile -cnotin @('fileServer', 'sqlServer') -or
+        $c.adminUsername -cnotmatch '^[A-Za-z][A-Za-z0-9_-]{0,19}$' -or
+        ($c.dataDiskSizeGB -isnot [int] -and $c.dataDiskSizeGB -isnot [long]) -or
+        $c.dataDiskSizeGB -lt 1 -or $c.dataDiskSizeGB -gt 32767 -or
+        $c.allowedCidrs -isnot [array] -or !$c.allowedCidrs.Count) { throw 'Invalid workload configuration.' }
+    foreach ($cidr in $c.allowedCidrs) {
+        if ($cidr -isnot [string]) { throw 'Invalid CIDR type.' }
+        $null = Get-CidrRange $cidr
+    }
+    if ($null -ne $c.fileServer) { Assert-Keys $c.fileServer @('shareName') }
+    if ($null -ne $c.sqlServer) {
+        Assert-Keys $c.sqlServer @('installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed')
+    }
+    if ($c.profile -eq 'fileServer') {
+        Assert-Keys $c.fileServer @('shareName')
+        if ($c.fileServer.shareName -cnotmatch '^[A-Za-z][A-Za-z0-9_-]{0,63}$' -or
+            $c.fileServer.shareName -in @('ADMIN', 'IPC', 'print')) { throw 'Invalid SMB share name.' }
+    } else {
+        Assert-Keys $c.sqlServer @('installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed')
+        $s = $c.sqlServer
+        if ($s.edition -cnotin @('Developer', 'Evaluation')) { throw 'Only SQL Developer or Evaluation is supported; paid editions are not automated.' }
+        if ($s.acceptLicenseTerms -isnot [bool] -or !$s.acceptLicenseTerms -or
+            ($s.PSObject.Properties.Name -contains 'productionLicenseConfirmed' -and
+                ($s.productionLicenseConfirmed -isnot [bool] -or $s.productionLicenseConfirmed))) {
+            throw 'Explicit license consent and nonproduction use are required.'
+        }
+        if ($s.installerSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'A SHA256 media checksum is required.' }
+        $null = Assert-MediaUrl $s.installerUrl
+    }
+    return $c
+}
+
+# Pure selection: never infer ownership from a drive letter alone.
+function Select-WorkloadDisk($Disks, $Partitions, $Volumes, [long]$SizeGB) {
+    $data = @($Disks | Where-Object { !$_.IsBoot -and !$_.IsSystem })
+    if ($data.Count -ne 1 -or $data[0].Size -ne $SizeGB * 1GB) { throw 'Expected exactly one data disk of the configured capacity; conflicting disks are unsafe.' }
+    $disk = $data[0]
+    $parts = @($Partitions | Where-Object DiskNumber -eq $disk.Number)
+    $ev = @($Volumes | Where-Object DriveLetter -eq 'E')
+    $ep = @($Partitions | Where-Object DriveLetter -eq 'E')
+    $labels = @($Volumes | Where-Object FileSystemLabel -eq 'WorkloadData')
+    if ($disk.PartitionStyle -eq 'RAW') {
+        if ($parts.Count -or $ev.Count -or $ep.Count -or $labels.Count) { throw 'RAW disk or E drive has conflicting existing content.' }
+        return [pscustomobject]@{ DiskNumber = $disk.Number; Initialize = $true }
+    }
+    $reserved = @($parts | Where-Object { $_.Type -eq 'Reserved' -and !$_.DriveLetter -and $_.Size -le 16MB })
+    if ($disk.PartitionStyle -ne 'GPT' -or $ev.Count -ne 1 -or $ep.Count -ne 1 -or $labels.Count -ne 1 -or
+        $ep[0].DiskNumber -ne $disk.Number -or $ep[0].Type -ne 'Basic' -or
+        $parts.Count -ne (1 + $reserved.Count) -or $reserved.Count -gt 1 -or
+        $ev[0].FileSystemLabel -ne 'WorkloadData' -or $ev[0].FileSystem -ne 'NTFS' -or
+        $ep[0].Size -lt ($disk.Size - 32MB) -or $ep[0].Size -gt $disk.Size -or
+        $ev[0].Size -lt ($disk.Size - 32MB) -or $ev[0].Size -gt $ep[0].Size) {
+        throw 'Existing data disk is not the expected single NTFS WorkloadData E volume; no disk was formatted.'
+    }
+    return [pscustomobject]@{ DiskNumber = $disk.Number; Initialize = $false }
+}
+
+function Initialize-WorkloadData([long]$SizeGB) {
+    $plan = Select-WorkloadDisk @(Get-Disk) @(Get-Partition) @(Get-Volume) $SizeGB
+    if ($plan.Initialize) {
+        # Re-read immediately before the only destructive operations.
+        $again = Select-WorkloadDisk @(Get-Disk) @(Get-Partition) @(Get-Volume) $SizeGB
+        if (!$again.Initialize -or $again.DiskNumber -ne $plan.DiskNumber) { throw 'Disk inventory changed.' }
+        Initialize-Disk -Number $plan.DiskNumber -PartitionStyle GPT | Out-Null
+        New-Partition -DiskNumber $plan.DiskNumber -DriveLetter E -UseMaximumSize |
+            Format-Volume -FileSystem NTFS -NewFileSystemLabel WorkloadData -Confirm:$false | Out-Null
+    }
+    $null = Select-WorkloadDisk @(Get-Disk) @(Get-Partition) @(Get-Volume) $SizeGB
+}
+
+function Assert-NoRestart {
+    if ((Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+        (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
+        (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations) {
+        throw 'A Windows restart is required. Restart manually, then rerun the extension; no automatic reboot was attempted.'
+    }
+}
+
+function Set-PrivateDirectory([string]$Path, [string[]]$Sids) {
+    $parent = $Path
+    while ($parent) {
+        if ((Test-Path -LiteralPath $parent) -and ((Get-Item -LiteralPath $parent -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Reparse points are not supported in workload paths.'
+        }
+        $parent = Split-Path -Path $parent -Parent
+    }
+    $null = New-Item -ItemType Directory -Path $Path -Force
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+    foreach ($sid in (@('S-1-5-32-544', 'S-1-5-18') + $Sids | Select-Object -Unique)) {
+        $id = New-Object System.Security.Principal.SecurityIdentifier($sid)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($id, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Assert-PrivateTree([string]$Path, [string]$AdminSid) {
+    $pending = New-Object 'Collections.Generic.Queue[string]'
+    $pending.Enqueue($Path)
+    while ($pending.Count) {
+        foreach ($item in Get-ChildItem -LiteralPath $pending.Dequeue() -Force) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse points in the share are unsafe.' }
+            foreach ($ace in (Get-Acl -LiteralPath $item.FullName).Access) {
+                if ($ace.AccessControlType -eq 'Allow' -and
+                    $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-32-544', 'S-1-5-18', $AdminSid)) {
+                    throw 'Existing share content has unexpected NTFS permissions.'
+                }
+            }
+            if ($item.PSIsContainer) { $pending.Enqueue($item.FullName) }
+        }
+    }
+}
+
+function Assert-ScopedFirewall([int]$Port, [string[]]$Cidrs) {
+    foreach ($profile in Get-NetFirewallProfile -PolicyStore ActiveStore) {
+        if (!$profile.Enabled -or $profile.DefaultInboundAction -ne 'Block') { throw 'All firewall profiles must be enabled with default inbound Block.' }
+    }
+    foreach ($r in Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Allow) {
+        $f = $r | Get-NetFirewallPortFilter
+        if ($f.Protocol -notin @('TCP', '6', 'Any', '256')) { continue }
+        $matchesPort = $false
+        foreach ($p in $f.LocalPort) {
+            if ($p -in @('Any', '*') -or $p -eq "$Port" -or
+                ($p -match '^(\d+)-(\d+)$' -and $Port -ge [int]$Matches[1] -and $Port -le [int]$Matches[2])) { $matchesPort = $true }
+        }
+        if (!$matchesPort) { continue }
+        foreach ($address in ($r | Get-NetFirewallAddressFilter).RemoteAddress) {
+            $contained = $false
+            try {
+                if ($address -notmatch '/') { $address += '/32' }
+                $range = Get-CidrRange $address
+                foreach ($cidr in $Cidrs) {
+                    $allowed = Get-CidrRange $cidr
+                    if ($range[0] -ge $allowed[0] -and $range[1] -le $allowed[1]) { $contained = $true }
+                }
+            } catch { $contained = $false }
+            if (!$contained) { throw 'An enabled inbound firewall rule exposes the workload port outside allowedCidrs. Resolve that policy manually.' }
+        }
+    }
+}
+
+function Set-WorkloadFirewall([int]$Port, [string[]]$Cidrs) {
+    Assert-ScopedFirewall $Port $Cidrs
+    $name = "AzureLocalWorkload-TCP-$Port"
+    $rule = @(Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object Name -eq $name)
+    if ($rule.Count) {
+        if ($rule.Count -ne 1 -or $rule[0].Group -ne 'AzureLocalWorkload') { throw 'Managed firewall rule name collision.' }
+        $rule[0] | Remove-NetFirewallRule
+    }
+    New-NetFirewallRule -Name $name -DisplayName $name -Group AzureLocalWorkload -Direction Inbound -Action Allow `
+        -Protocol TCP -LocalPort $Port -RemoteAddress $Cidrs -Profile Any -Enabled True -EdgeTraversalPolicy Block | Out-Null
+    if (!(Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object { $_.Name -eq $name -and $_.Enabled -eq 'True' })) {
+        throw 'Workload firewall rule is not effective.'
+    }
+    Assert-ScopedFirewall $Port $Cidrs
+}
+
+function Set-FileServer($Config, $Admin) {
+    $feature = Install-WindowsFeature FS-FileServer
+    if (!$feature.Success -or $feature.RestartNeeded -ne 'No') { throw 'File server role requires a restart or installation failed; rerun after manual recovery.' }
+    Assert-ScopedFirewall 445 $Config.allowedCidrs
+    $path = "E:\Shares\$($Config.fileServer.shareName)"
+    Set-PrivateDirectory 'E:\Shares' @($Admin.SID.Value)
+    Set-PrivateDirectory $path @($Admin.SID.Value)
+    Assert-PrivateTree $path $Admin.SID.Value
+    $share = @(Get-SmbShare | Where-Object Name -eq $Config.fileServer.shareName)
+    if ($share.Count -and ($share.Count -ne 1 -or $share[0].Path -ne $path -or $share[0].Special)) { throw 'Existing share name collision.' }
+    $account = "$env:COMPUTERNAME\$($Admin.Name)"
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -EnableSMB2Protocol $true -RejectUnencryptedAccess $true -Confirm:$false
+    if (!$share.Count) {
+        New-SmbShare -Name $Config.fileServer.shareName -Path $path -FullAccess $account -EncryptData $true -FolderEnumerationMode AccessBased | Out-Null
+    } else {
+        Set-SmbShare -Name $Config.fileServer.shareName -EncryptData $true -FolderEnumerationMode AccessBased -Force
+        foreach ($entry in Get-SmbShareAccess -Name $Config.fileServer.shareName) {
+            if ($entry.AccessControlType -eq 'Deny') { throw 'Unexpected deny ACL on existing share.' }
+            Revoke-SmbShareAccess -Name $Config.fileServer.shareName -AccountName $entry.AccountName -Force
+        }
+        Grant-SmbShareAccess -Name $Config.fileServer.shareName -AccountName $account -AccessRight Full -Force | Out-Null
+    }
+    $actual = Get-SmbShare -Name $Config.fileServer.shareName
+    $access = @(Get-SmbShareAccess -Name $Config.fileServer.shareName)
+    if (!$actual.EncryptData -or $access.Count -ne 1 -or $access[0].AccountName -ne $account -or $access[0].AccessRight -ne 'Full') { throw 'SMB verification failed.' }
+    Set-WorkloadFirewall 445 $Config.allowedCidrs
+}
+
+function Get-SqlResult([string]$Query, [string]$Server = 'lpc:.') {
+    for ($i = 0; $i -lt 12; $i++) {
+        $connection = New-Object System.Data.SqlClient.SqlConnection("Server=$Server;Integrated Security=SSPI;Encrypt=True;TrustServerCertificate=True;Connect Timeout=5")
+        try {
+            $connection.Open()
+            $command = $connection.CreateCommand()
+            $command.CommandTimeout = 10
+            $command.CommandText = $Query
+            $table = New-Object System.Data.DataTable
+            $reader = $command.ExecuteReader()
+            $table.Load($reader)
+            return ,$table
+        } catch {
+            if ($i -eq 11) { throw 'SQL integrated query readiness failed after bounded retry.' }
+        } finally { $connection.Dispose() }
+        Start-Sleep -Seconds 5
+    }
+}
+
+function Assert-SqlInstance($Sql, [string]$Account, [string]$SystemAccount, [string]$Server = 'lpc:.') {
+    $Account = $Account.Replace("'", "''")
+    $SystemAccount = $SystemAccount.Replace("'", "''")
+    $query = @"
+SELECT 1 AS Probe, CONVERT(int,SERVERPROPERTY('ProductMajorVersion')) AS Major,
+CONVERT(nvarchar(128),SERVERPROPERTY('Edition')) AS Edition,
+CONVERT(int,SERVERPROPERTY('IsIntegratedSecurityOnly')) AS WindowsOnly,
+CONVERT(nvarchar(260),SERVERPROPERTY('InstanceDefaultDataPath')) AS DataPath,
+CONVERT(nvarchar(260),SERVERPROPERTY('InstanceDefaultLogPath')) AS LogPath,
+IS_SRVROLEMEMBER('sysadmin',N'$Account') AS AdminRole,
+IS_SRVROLEMEMBER('sysadmin',N'$SystemAccount') AS SystemRole,
+(SELECT COUNT(*) FROM sys.master_files WHERE physical_name NOT LIKE N'E:\Sql\%'
+ OR (database_id > 4 AND physical_name NOT LIKE CASE WHEN type=1 THEN N'E:\Sql\Log\%' ELSE N'E:\Sql\Data\%' END)
+ OR (database_id=2 AND physical_name NOT LIKE N'E:\Sql\Temp\%')) AS BadPaths
+"@
+    $row = (Get-SqlResult $query $Server).Rows[0]
+    $edition = if ($Sql.edition -eq 'Developer') { 'Developer Edition*' } else { 'Enterprise Evaluation Edition*' }
+    if ($row.Probe -ne 1 -or $row.Major -ne 16 -or $row.Edition -notlike $edition -or $row.WindowsOnly -ne 1 -or
+        $row.DataPath.TrimEnd('\') -ne 'E:\Sql\Data' -or $row.LogPath.TrimEnd('\') -ne 'E:\Sql\Log' -or
+        $row.AdminRole -ne 1 -or $row.SystemRole -ne 1 -or $row.BadPaths -ne 0) {
+        throw 'Existing SQL version, edition, authentication, sysadmins, or data/log paths do not match; refusing to repurpose the instance.'
+    }
+}
+
+function Save-SqlIso($Sql, [string]$Path) {
+    $uri = Assert-MediaUrl $Sql.installerUrl
+    # Do not follow redirects to credential-bearing, private, or non-HTTPS locations.
+    try { $addresses = [Net.Dns]::GetHostAddresses($uri.DnsSafeHost) }
+    catch { throw 'SQL media DNS resolution failed.' }
+    if (!$addresses.Count) { throw 'SQL media DNS resolution failed.' }
+    foreach ($ip in $addresses) {
+        $b = $ip.GetAddressBytes()
+        if ($b.Length -eq 16) {
+            if (($b[0] -band 224) -ne 32 -or ($b[0] -eq 32 -and $b[1] -eq 1 -and $b[2] -eq 13 -and $b[3] -eq 184)) {
+                throw 'SQL media must resolve only to public addresses.'
+            }
+        } elseif ($b[0] -in @(0, 10, 127) -or $b[0] -ge 224 -or
+            ($b[0] -eq 169 -and $b[1] -eq 254) -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or
+            ($b[0] -eq 192 -and $b[1] -eq 168) -or ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127)) {
+            throw 'SQL media must resolve only to public addresses.'
+        }
+    }
+    Add-Type -AssemblyName System.Net.Http
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $handler = New-Object Net.Http.HttpClientHandler
+    $handler.AllowAutoRedirect = $false
+    $client = New-Object Net.Http.HttpClient($handler)
+    $client.Timeout = [TimeSpan]::FromMinutes(60)
+    try {
+        $response = $client.GetAsync($uri, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        try {
+            if ([int]$response.StatusCode -ne 200) { throw 'Media HTTP status was not 200.' }
+            $stream = [IO.File]::Create($Path)
+            try {
+                if (!$response.Content.CopyToAsync($stream).Wait([TimeSpan]::FromMinutes(60))) { throw 'Media download timeout.' }
+            } finally { $stream.Dispose() }
+        } finally { $response.Dispose() }
+    } catch { throw 'SQL ISO download failed. Use a direct public HTTPS ISO URL; redirects are not accepted.' }
+    finally { $client.Dispose(); $handler.Dispose() }
+    if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Sql.installerSha256) { throw 'SQL ISO SHA256 mismatch; setup was not executed.' }
+}
+
+function Install-SqlInstance($Sql, [string]$Account, [string]$SystemAccount) {
+    # Public setup flags and predefined free-edition PIDs:
+    # https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-from-the-command-prompt?view=sql-server-ver16
+    $cache = "$env:ProgramData\AzureLocalWorkload"
+    Set-PrivateDirectory $cache @()
+    $iso = Join-Path $cache "$([guid]::NewGuid()).iso"
+    if ((Test-Path 'E:\Sql') -and @(Get-ChildItem 'E:\Sql' -Force).Count) { throw 'SQL data directory is not empty; refusing a new installation.' }
+    Set-PrivateDirectory 'E:\Sql' @()
+    try {
+        Save-SqlIso $Sql $iso
+        $image = Mount-DiskImage -ImagePath $iso -PassThru
+        try {
+            $volumes = @($image | Get-Volume)
+            if ($volumes.Count -ne 1 -or !$volumes[0].DriveLetter) { throw 'SQL ISO has an unexpected volume layout.' }
+            $root = "$($volumes[0].DriveLetter):\"
+            $setup = Join-Path $root 'setup.exe'
+            if (!(Test-Path "$($root)x64\setup\sql_engine_core_inst.msi") -or !(Test-Path $setup) -or
+                (Get-Item $setup).VersionInfo.ProductVersion -notmatch '^(16\.|2022\.160\.)') { throw 'A full SQL Server 2022 x64 ISO is required.' }
+            $signature = Get-AuthenticodeSignature $setup
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation,') { throw 'SQL setup signature verification failed.' }
+            $arguments = '/Q /ACTION=Install /FEATURES=SQLENGINE /INSTANCENAME=MSSQLSERVER /IACCEPTSQLSERVERLICENSETERMS /SUPPRESSPRIVACYSTATEMENTNOTICE /UPDATEENABLED=False /TCPENABLED=0 /NPENABLED=0 /SQLSVCACCOUNT="NT Service\MSSQLSERVER" /SQLSVCSTARTUPTYPE=Automatic /AGTSVCACCOUNT="NT Service\SQLSERVERAGENT" /AGTSVCSTARTUPTYPE=Disabled /BROWSERSVCSTARTUPTYPE=Disabled /INSTALLSQLDATADIR="E:\Sql" /SQLUSERDBDIR="E:\Sql\Data" /SQLUSERDBLOGDIR="E:\Sql\Log" /SQLTEMPDBDIR="E:\Sql\Temp" /SQLTEMPDBLOGDIR="E:\Sql\Temp" /SQLBACKUPDIR="E:\Sql\Backup"'
+            if ($Sql.edition -eq 'Developer') { $arguments += ' /PID=22222-00000-00000-00000-00000' }
+            else {
+                # Omitted PID means Evaluation only on evaluation media, not media with a predefined paid/developer key.
+                $defaults = Join-Path $root 'x64\DefaultSetup.ini'
+                if ((Test-Path $defaults) -and ((Get-Content $defaults -Raw) -match '(?im)^\s*PID\s*=\s*"?([A-Za-z0-9-]+)' ) -and
+                    $Matches[1] -ne '00000-00000-00000-00000-00000') {
+                    throw 'Evaluation requires evaluation ISO media.'
+                }
+            }
+            $arguments += " /SQLSYSADMINACCOUNTS=`"$Account`" `"$SystemAccount`""
+            $process = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru
+            if ($process.ExitCode -in @(3010, 1641)) { throw 'SQL setup requires a manual restart; rerun after restart.' }
+            if ($process.ExitCode -ne 0) { throw "SQL setup failed with exit code $($process.ExitCode). Review local SQL setup logs." }
+        } finally { Dismount-DiskImage -ImagePath $iso | Out-Null }
+    } finally { if (Test-Path $iso) { Remove-Item -LiteralPath $iso -Force } }
+}
+
+function Set-SqlServer($Config, $Admin) {
+    $sql = $Config.sqlServer
+    $account = "$env:COMPUTERNAME\$($Admin.Name)"
+    $systemAccount = ([Security.Principal.SecurityIdentifier]'S-1-5-18').Translate([Security.Principal.NTAccount]).Value
+    foreach ($path in @('E:\Sql', 'E:\Sql\Data', 'E:\Sql\Log', 'E:\Sql\Temp', 'E:\Sql\Backup')) {
+        if ((Test-Path $path) -and ((Get-Item $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Reparse points in SQL paths are unsafe.'
+        }
+    }
+    $instanceKey = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL'
+    $instances = Get-ItemProperty $instanceKey -ErrorAction SilentlyContinue
+    $service = Get-Service MSSQLSERVER -ErrorAction SilentlyContinue
+    if (!$service -and !$instances) { Install-SqlInstance $sql $account $systemAccount }
+    elseif (!$service -or $instances.MSSQLSERVER -ne 'MSSQL16.MSSQLSERVER') { throw 'Unexpected or incomplete existing SQL installation.' }
+    Assert-NoRestart
+    $svc = Get-CimInstance Win32_Service -Filter "Name='MSSQLSERVER'"
+    if ($svc.StartName -ne 'NT Service\MSSQLSERVER') { throw 'Unexpected SQL service identity.' }
+    Start-Service MSSQLSERVER
+    Assert-SqlInstance $sql $account $systemAccount
+    $null = Get-SqlResult "DECLARE @q nvarchar(300); SELECT @q=N'ALTER LOGIN '+QUOTENAME(name)+N' DISABLE' FROM sys.server_principals WHERE sid=0x01; IF @q IS NOT NULL EXEC(@q); SELECT 1;"
+    $base = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQLServer'
+    if ((Get-ItemProperty $base).LoginMode -ne 1) { throw 'SQL must use Windows authentication only.' }
+    $tcp = "$base\SuperSocketNetLib\Tcp"
+    $changed = $false
+    foreach ($setting in @(@($tcp, 'Enabled', 1), @($tcp, 'ListenOnAllIPs', 1), @("$base\SuperSocketNetLib\Np", 'Enabled', 0))) {
+        if ((Get-ItemProperty $setting[0]).($setting[1]) -ne $setting[2]) {
+            Set-ItemProperty $setting[0] -Name $setting[1] -Value $setting[2]
+            $changed = $true
+        }
+    }
+    foreach ($ip in Get-ChildItem $tcp | Where-Object PSChildName -like 'IP*') {
+        foreach ($setting in @(@('TcpDynamicPorts', ''), @('TcpPort', '1433'))) {
+            if ((Get-ItemProperty $ip.PSPath).($setting[0]) -cne $setting[1]) {
+                Set-ItemProperty $ip.PSPath -Name $setting[0] -Value $setting[1]
+                $changed = $true
+            }
+        }
+    }
+    Stop-Service SQLBrowser -ErrorAction Stop
+    Set-Service SQLBrowser -StartupType Disabled
+    Set-Service MSSQLSERVER -StartupType Automatic
+    if ($changed) { Restart-Service MSSQLSERVER -Force }
+    Assert-SqlInstance $sql $account $systemAccount 'tcp:localhost,1433'
+    $row = (Get-SqlResult 'SELECT COUNT(*) AS EnabledSa FROM sys.server_principals WHERE sid=0x01 AND is_disabled=0').Rows[0]
+    if ($row.EnabledSa -ne 0 -or (Get-Service MSSQLSERVER).Status -ne 'Running' -or
+        (Get-CimInstance Win32_Service -Filter "Name='SQLBrowser'").StartMode -ne 'Disabled') { throw 'SQL service or SA verification failed.' }
+    Set-WorkloadFirewall 1433 $Config.allowedCidrs
+}
+
+function Invoke-WorkloadConfiguration([string]$Payload) {
+    $ErrorActionPreference = 'Stop'
+    $c = Read-WorkloadConfiguration $Payload
+    if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-18' -or ![Environment]::Is64BitProcess) { throw 'Run using 64-bit Windows PowerShell as SYSTEM.' }
+    $os = Get-CimInstance Win32_OperatingSystem
+    if ($os.BuildNumber -ne '20348' -or $os.ProductType -eq 1) { throw 'Windows Server 2022 is required.' }
+    Assert-NoRestart
+    $admin = Get-LocalUser -Name $c.adminUsername
+    $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544')
+    if (!$admin.Enabled -or $admin.SID.Value -notin $members.SID.Value) { throw 'adminUsername must be an enabled local Administrator.' }
+    $port = if ($c.profile -eq 'fileServer') { 445 } else { 1433 }
+    Assert-ScopedFirewall $port $c.allowedCidrs
+    Initialize-WorkloadData $c.dataDiskSizeGB
+    if ($c.profile -eq 'fileServer') { Set-FileServer $c $admin } else { Set-SqlServer $c $admin }
+    Assert-NoRestart
+    Write-Output 'Workload configuration verified.'
+}
+
+if ($MyInvocation.InvocationName -ne '.') { Invoke-WorkloadConfiguration $ConfigurationBase64 }

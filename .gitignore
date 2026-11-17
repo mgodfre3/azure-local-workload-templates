@@ -1,0 +1,5 @@
+.tools/
+out/
+answers/*.local.json
+*.parameters.json
+*.log

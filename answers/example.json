@@ -1,0 +1,77 @@
+{
+  "$schema": "./schema.json",
+  "schemaVersion": 1,
+  "deploymentName": "branch-office",
+  "subscriptionId": "00000000-0000-0000-0000-000000000000",
+  "resourceGroup": "rg-workloads",
+  "location": "eastus",
+  "stamp": {
+    "clusterResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-stamp/providers/Microsoft.AzureStackHCI/clusters/local-stamp",
+    "customLocationId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-stamp/providers/Microsoft.ExtendedLocation/customLocations/local-location",
+    "mappingConfirmed": true
+  },
+  "logicalNetworkId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-stamp/providers/Microsoft.AzureStackHCI/logicalNetworks/workload-network",
+  "storageContainerId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-stamp/providers/Microsoft.AzureStackHCI/storageContainers/workload-storage",
+  "adminUsername": "workloadadmin",
+  "passwordSource": { "type": "prompt" },
+  "logAnalyticsWorkspaceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-monitor/providers/Microsoft.OperationalInsights/workspaces/workload-logs",
+  "workloads": [
+    {
+      "name": "files-01",
+      "profile": "fileServer",
+      "processors": 2,
+      "memoryMB": 4096,
+      "dataDiskSizeGB": 128,
+      "allowedCidrs": ["10.40.0.0/24"],
+      "image": {
+        "source": "marketplace",
+        "os": "WindowsServer2022",
+        "name": "windows-2022-approved",
+        "publisher": "microsoftwindowsserver",
+        "offer": "windowsserver",
+        "sku": "2022-datacenter-azure-edition",
+        "version": "20348.2461.240510",
+        "licenseAndMarketplaceTermsConfirmed": true
+      },
+      "fileServer": { "shareName": "Department" }
+    },
+    {
+      "name": "sql-01",
+      "profile": "sqlServer",
+      "processors": 4,
+      "memoryMB": 8192,
+      "dataDiskSizeGB": 128,
+      "allowedCidrs": ["10.40.0.0/24"],
+      "image": {
+        "source": "marketplace",
+        "os": "WindowsServer2022",
+        "name": "windows-2022-approved",
+        "publisher": "microsoftwindowsserver",
+        "offer": "windowsserver",
+        "sku": "2022-datacenter-azure-edition",
+        "version": "20348.2461.240510",
+        "licenseAndMarketplaceTermsConfirmed": true
+      },
+      "sqlServer": {
+        "installerUrl": "https://downloads.example.org/sql-server-2022.iso",
+        "installerSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "edition": "Developer",
+        "acceptLicenseTerms": true
+      }
+    },
+    {
+      "name": "web-01",
+      "profile": "webServer",
+      "processors": 2,
+      "memoryMB": 2048,
+      "allowedCidrs": ["10.40.0.0/24"],
+      "sshPublicKey": "ssh-rsa REPLACE_WITH_YOUR_RSA_2048_OR_LARGER_PUBLIC_KEY",
+      "image": {
+        "source": "existing",
+        "os": "Ubuntu2204",
+        "resourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-workloads/providers/Microsoft.AzureStackHCI/galleryImages/ubuntu-2204-prepared",
+        "preparedImageConfirmed": true
+      }
+    }
+  ]
+}
