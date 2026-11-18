@@ -10,7 +10,7 @@ param workload object
 param deploymentSet string
 param runId string
 
-var isLinux = workload.profile == 'webServer'
+var isLinux = workload.isLinux
 var ownership = {
   project: 'azure-local-workload-templates'
   deploymentSet: deploymentSet
@@ -51,8 +51,8 @@ resource nic 'Microsoft.AzureStackHCI/networkInterfaces@2024-01-01' = {
   }
 }
 
-resource dataDisk 'Microsoft.AzureStackHCI/virtualHardDisks@2024-01-01' = if (!isLinux) {
-  name: '${workload.name}-data'
+resource dataDisk 'Microsoft.AzureStackHCI/virtualHardDisks@2024-01-01' = [for disk in workload.dataDisks: {
+  name: '${workload.name}-${disk.role}'
   location: location
   tags: ownership
   extendedLocation: {
@@ -61,10 +61,10 @@ resource dataDisk 'Microsoft.AzureStackHCI/virtualHardDisks@2024-01-01' = if (!i
   }
   properties: {
     containerId: storageContainerId
-    diskSizeGB: workload.dataDiskSizeGB
+    diskSizeGB: disk.sizeGB
     dynamic: true
   }
-}
+}]
 
 resource vm 'Microsoft.AzureStackHCI/virtualMachineInstances@2024-01-01' = {
   name: 'default'
@@ -109,11 +109,9 @@ resource vm 'Microsoft.AzureStackHCI/virtualMachineInstances@2024-01-01' = {
         id: workload.imageId
       }
       vmConfigStoragePathId: storageContainerId
-      dataDisks: isLinux ? [] : [
-        {
-          id: dataDisk!.id
-        }
-      ]
+      dataDisks: [for (disk, i) in workload.dataDisks: {
+        id: dataDisk[i].id
+      }]
     }
     networkProfile: {
       networkInterfaces: [
@@ -125,7 +123,7 @@ resource vm 'Microsoft.AzureStackHCI/virtualMachineInstances@2024-01-01' = {
   }
 }
 
-resource configure 'Microsoft.HybridCompute/machines/extensions@2024-07-10' = {
+resource configure 'Microsoft.HybridCompute/machines/extensions@2024-07-10' = if (workload.configureGuest) {
   parent: machine
   name: 'workload-configuration'
   location: location
@@ -153,6 +151,7 @@ module monitoring 'monitoring.bicep' = {
   }
   dependsOn: [
     configure
+    vm
   ]
 }
 

@@ -41,6 +41,20 @@ Describe 'Compiled ARM deployment contract' {
         $vm.properties.storageProfile.vmConfigStoragePathId | Should -Match "parameters\('storageContainerId'\)"
     }
 
+    It 'creates role-named disks at the requested sizes for either OS and gates service configuration' {
+        $disk = @($workload.resources | Where-Object type -EQ 'Microsoft.AzureStackHCI/virtualHardDisks')[0]
+        $disk.copy.count | Should -Match 'dataDisks'
+        $disk.name | Should -Match '\.role'
+        $disk.properties.diskSizeGB | Should -Match '\.sizeGB'
+        $vm = @($workload.resources | Where-Object type -EQ 'Microsoft.AzureStackHCI/virtualMachineInstances')[0]
+        $vm.properties.storageProfile.copy[0].name | Should -Be dataDisks
+        $vm.properties.storageProfile.copy[0].count | Should -Match 'dataDisks'
+        $configure = @($workload.resources | Where-Object type -EQ 'Microsoft.HybridCompute/machines/extensions')[0]
+        $configure.condition | Should -Match 'configureGuest'
+        $workload.variables.isLinux | Should -Match '\.isLinux'
+        ($vm.properties.storageProfile | ConvertTo-Json -Depth 20) | Should -Not -Match 'suggestedOsDiskSizeGB'
+    }
+
     It 'waits for guest configuration before deploying real AMA, DCR and association resources' {
         $monitoringModule = @($workload.resources | Where-Object type -EQ 'Microsoft.Resources/deployments')[0]
         ($monitoringModule.dependsOn -join ' ') | Should -Match 'workload-configuration'

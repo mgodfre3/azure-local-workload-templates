@@ -88,7 +88,97 @@ function Read-WorkloadAnswers {
     }
     $answers = $json | ConvertFrom-Json -AsHashtable
     Assert-Answers $answers
+    $answers.workloads = @(Expand-Workloads $answers.workloads)
     $answers
+}
+
+function Test-LinuxProfile {
+    param([hashtable]$Workload)
+    $Workload.profile -in @('webServer', 'linuxApp')
+}
+
+function Get-WorkloadDisks {
+    param([hashtable]$Workload)
+    if ($Workload.ContainsKey('dataDiskSizeGB')) {
+        @{ role = 'data'; sizeGB = $Workload.dataDiskSizeGB }
+    } elseif ($Workload.ContainsKey('dataDisks')) {
+        $Workload.dataDisks | Sort-Object role
+    }
+}
+
+function Expand-Workloads {
+    param([array]$Workloads)
+    $instances = @()
+    $names = @{}
+    $ips = @{}
+    foreach ($entry in $Workloads) {
+        $count = if ($entry.ContainsKey('count')) { $entry.count } else { 1 }
+        if ($entry.ContainsKey('count') -and $entry.name.Length -gt 12) { throw 'Counted workload names must be at most 12 characters, leaving room for -01 through -20.' }
+        if ($entry.ContainsKey('privateIpAddresses')) {
+            if (!$entry.ContainsKey('count') -or $entry.ContainsKey('privateIpAddress') -or $entry.privateIpAddresses.Count -ne $count) {
+                throw 'privateIpAddresses requires count, exactly one address per instance, and no privateIpAddress.'
+            }
+        }
+        if ($entry.ContainsKey('count') -and $entry.ContainsKey('privateIpAddress')) {
+            throw 'Counted workloads require privateIpAddresses instead of privateIpAddress; no addresses are auto-incremented.'
+        }
+        for ($i = 0; $i -lt $count; $i++) {
+            $item = $entry.Clone()
+            $item.Remove('count')
+            $item.Remove('privateIpAddresses')
+            if ($entry.ContainsKey('count')) { $item.name = '{0}-{1:00}' -f $entry.name, ($i + 1) }
+            if ($names.ContainsKey($item.name)) { throw 'Expanded VM names must be unique; a counted name collides with another entry.' }
+            $names[$item.name] = $true
+            if ($entry.ContainsKey('privateIpAddresses')) { $item.privateIpAddress = $entry.privateIpAddresses[$i] }
+            if ($item.ContainsKey('privateIpAddress')) {
+                $null = ConvertTo-IPv4Number $item.privateIpAddress
+                if ($ips.ContainsKey($item.privateIpAddress)) { throw 'Static IP addresses must be unique across all instances.' }
+                $ips[$item.privateIpAddress] = $true
+            }
+            $instances += $item
+            if ($instances.Count -gt 100) { throw 'A deployment may contain at most 100 VMs in total.' }
+        }
+    }
+    $instances
+}
+
+function Get-WorkloadSummary {
+    param([array]$Workloads)
+    $summary = [ordered]@{ vmCount = $Workloads.Count; processors = 0; memoryMB = 0; dataDiskCount = 0; dataDiskGB = 0; suggestedOsDiskGB = 0; unspecifiedOsDiskCount = 0 }
+    foreach ($item in $Workloads) {
+        $summary.processors += $item.processors
+        $summary.memoryMB += $item.memoryMB
+        $disks = @(Get-WorkloadDisks $item)
+        $summary.dataDiskCount += $disks.Count
+        foreach ($disk in $disks) { $summary.dataDiskGB += $disk.sizeGB }
+        if ($item.ContainsKey('suggestedOsDiskSizeGB')) { $summary.suggestedOsDiskGB += $item.suggestedOsDiskSizeGB }
+        else { $summary.unspecifiedOsDiskCount++ }
+    }
+    $summary
+}
+
+function Assert-PreparedImageSource {
+    param([hashtable]$Image)
+    if ($Image.name -match 'windows' -or $Image.sha256 -match '^0{64}$') {
+        throw 'Prepared image imports require a nonplaceholder verified SHA256 and an image name without the reserved keyword Windows.'
+    }
+    if ($Image.source -eq 'local') {
+        # Deliberately do not Test-Path on the client: the path belongs to the stamp.
+        if ($Image.path -notmatch '^[a-zA-Z]:\\ClusterStorage\\[^\\]+\\.+\.vhdx$' -or
+            $Image.path -match '[\x00-\x1f"*?<>|]' -or $Image.path.Substring(2).Contains(':') -or
+            @($Image.path.Split('\') | Where-Object { $_ -in @('.', '..') -or $_ -match '[. ]$' }).Count) {
+            throw 'Local images require an absolute stamp CSV path such as C:\ClusterStorage\Volume1\Images\ubuntu.vhdx, not a client file, relative path or arbitrary UNC share.'
+        }
+    } else {
+        $uri = $null
+        if (![uri]::TryCreate($Image.uri, [UriKind]::Absolute, [ref]$uri) -or
+            $uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or !$uri.IsDefaultPort -or
+            $uri.Host -notmatch '^[a-z0-9]{3,24}\.blob\.core\.windows\.net$' -or
+            $uri.AbsolutePath -notmatch '^/[^/]+/.+\.vhdx?$' -or $Image.uri -match '[\s\\]' -or
+            $Image.uri -match '%(0[0-9a-f]|1[0-9a-f]|7f)') {
+            throw 'Blob image URI must be a noncredentialed Azure public-cloud blob HTTPS VHD/VHDX URL without query/fragment; inject the SAS through the named process environment variable.'
+        }
+    }
 }
 
 function Assert-Answers {
@@ -111,23 +201,36 @@ function Assert-Answers {
     foreach ($workload in $Answers.workloads) {
         if ($names.ContainsKey($workload.name)) { throw 'Workload names must be unique (case-insensitive).' }
         $names[$workload.name] = $true
+        if ($workload.ContainsKey('count') -and $workload.count -eq 0) { continue }
         foreach ($cidr in $workload.allowedCidrs) { $null = Get-CidrRange $cidr }
         if ($workload.ContainsKey('privateIpAddress')) {
             $null = ConvertTo-IPv4Number $workload.privateIpAddress
             if ($ips.ContainsKey($workload.privateIpAddress)) { throw 'Static IP addresses must be unique.' }
             $ips[$workload.privateIpAddress] = $true
         }
-        if ($workload.profile -eq 'webServer') { Assert-RsaPublicKey $workload.sshPublicKey }
+        $roles = @{}
+        foreach ($disk in @(Get-WorkloadDisks $workload)) {
+            if ($roles.ContainsKey($disk.role)) { throw 'Data disk roles must be unique per VM.' }
+            $roles[$disk.role] = $true
+        }
+        if (Test-LinuxProfile $workload) { Assert-RsaPublicKey $workload.sshPublicKey }
         $image = $workload.image
         if ($image.source -eq 'existing') {
             Assert-ResourceId $image.resourceId 'Microsoft\.AzureStackHCI/(galleryImages|marketplaceGalleryImages)' $sub
-            if ($workload.profile -eq 'webServer' -and $image.resourceId -notmatch '/galleryImages/') {
+            if ((Test-LinuxProfile $workload) -and $image.resourceId -notmatch '/galleryImages/') {
                 throw 'Ubuntu requires a prepared NoCloud custom gallery image, not a direct Marketplace import.'
             }
-        } else {
+        } elseif ($image.source -eq 'marketplace') {
             $definition = "$($image.publisher):$($image.offer):$($image.sku):$($image.version)"
             if ($imageDefinitions.ContainsKey($image.name) -and $imageDefinitions[$image.name] -ne $definition) {
                 throw 'The same Marketplace image name cannot refer to different versions.'
+            }
+            $imageDefinitions[$image.name] = $definition
+        } else {
+            Assert-PreparedImageSource $image
+            $definition = "$($image.source):$($image['path']):$($image['uri']):$($image.sha256):$($image.os)"
+            if ($imageDefinitions.ContainsKey($image.name) -and $imageDefinitions[$image.name] -ne $definition) {
+                throw 'The same prepared image name cannot refer to different source definitions.'
             }
             $imageDefinitions[$image.name] = $definition
         }
@@ -140,6 +243,7 @@ function Assert-Answers {
             }
         }
     }
+    $null = @(Expand-Workloads $Answers.workloads)
 }
 
 function Open-ArmConnection {
@@ -273,7 +377,7 @@ function Get-ImagePlan {
         if ($wanted.source -eq 'existing') {
             $matches = @($Inventory | Where-Object { $_.id -eq $wanted.resourceId })
             if (!$matches.Count) { throw "Existing image for '$($workload.name)' was not found or is inaccessible." }
-        } else {
+        } elseif ($wanted.source -eq 'marketplace') {
             $targetId = "$rgId/providers/Microsoft.AzureStackHCI/marketplaceGalleryImages/$($wanted.name)"
             $named = @($Inventory | Where-Object { $_.id -eq $targetId })
             $matches = @($Inventory | Where-Object {
@@ -288,11 +392,24 @@ function Get-ImagePlan {
             if ($named.Count -and !@($matches | Where-Object id -EQ $targetId).Count) { throw 'Requested image name is already occupied by an incompatible image. Nothing will be overwritten.' }
             if ($named.Count) { $matches = $named }
             if (!$matches.Count) { $import = $true }
+        } else {
+            $targetId = "$rgId/providers/Microsoft.AzureStackHCI/galleryImages/$($wanted.name)"
+            $named = @($Inventory | Where-Object { $_.id -eq $targetId })
+            $matches = @($Inventory | Where-Object {
+                $_.type -eq 'Microsoft.AzureStackHCI/galleryImages' -and
+                $_.extendedLocation.name -eq $Answers.stamp.customLocationId -and
+                $_.properties.osType -eq 'Linux' -and $_.properties.hyperVGeneration -eq 'V2' -and
+                $_.properties['cloudInitDataSource'] -eq 'NoCloud' -and
+                $_['tags'] -and $_.tags['preparedImageSha256'] -eq $wanted.sha256
+            } | Sort-Object @{ Expression = { $_.properties.provisioningState -eq 'Succeeded' }; Descending = $true }, id)
+            if ($named.Count -and !@($matches | Where-Object id -EQ $targetId).Count) { throw 'Requested prepared image name is occupied by an incompatible or unverified image. Use its explicit existing resource ID after verification, or a new name.' }
+            if ($named.Count) { $matches = $named }
+            if (!$matches.Count) { $import = $true }
         }
         if (!$import) {
             $image = $matches[0]
             Assert-ReadyResource $image $Answers.stamp.customLocationId $Answers.location
-            $os = if ($workload.profile -eq 'webServer') { 'Linux' } else { 'Windows' }
+            $os = if (Test-LinuxProfile $workload) { 'Linux' } else { 'Windows' }
             if ($image.properties.osType -ne $os -or $image.properties.hyperVGeneration -ne 'V2') { throw 'Image must have the expected OS type and Hyper-V generation V2.' }
             if ($os -eq 'Linux' -and $image.properties['cloudInitDataSource'] -and $image.properties.cloudInitDataSource -ne 'NoCloud') {
                 throw 'Ubuntu custom image declares a data source other than NoCloud.'
@@ -320,6 +437,9 @@ function Get-ConfigurationHash {
         sqlEdition = if ($Workload.profile -eq 'sqlServer') { $Workload.sqlServer.edition } else { '' }
         sqlMediaHash = if ($Workload.profile -eq 'sqlServer') { $Workload.sqlServer.installerSha256.ToLowerInvariant() } else { '' }
     }
+    if ($Workload.ContainsKey('dataDisks')) {
+        $value.dataDisks = @(Get-WorkloadDisks $Workload | ForEach-Object { [ordered]@{ role = $_.role; sizeGB = $_.sizeGB } })
+    }
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($value | ConvertTo-Json -Compress)))).ToLowerInvariant()
 }
 
@@ -341,12 +461,12 @@ function Assert-VmMatchesConfiguration {
     $expectedNic = "$ResourceGroupId/providers/Microsoft.AzureStackHCI/networkInterfaces/$($Workload.name)-nic"
     $nicIds = @($properties.networkProfile.networkInterfaces | ForEach-Object { $_.id })
     $diskIds = @($properties.storageProfile['dataDisks'] | Where-Object { $null -ne $_ } | ForEach-Object { $_.id })
-    $expectedDisks = if ($Workload.profile -eq 'webServer') { @() } else { @("$ResourceGroupId/providers/Microsoft.AzureStackHCI/virtualHardDisks/$($Workload.name)-data") }
+    $expectedDisks = @(Get-WorkloadDisks $Workload | ForEach-Object { "$ResourceGroupId/providers/Microsoft.AzureStackHCI/virtualHardDisks/$($Workload.name)-$($_.role)" })
     if ($properties.storageProfile.imageReference.id -ne $ImageId -or
         $properties.hardwareProfile.processors -ne $Workload.processors -or
         $properties.hardwareProfile.memoryMB -ne $Workload.memoryMB -or
         $nicIds.Count -ne 1 -or $nicIds[0] -ne $expectedNic -or
-        ($diskIds -join '|') -ne ($expectedDisks -join '|')) {
+        (@($diskIds | Sort-Object) -join '|') -ne (@($expectedDisks | Sort-Object) -join '|')) {
         throw "Existing VM '$($Workload.name)' has image, hardware, NIC or disk drift. Refusing to replace settings or detach customer resources."
     }
 }
@@ -389,7 +509,7 @@ function Invoke-WorkloadPreflight {
         'Microsoft.Insights/dataCollectionRules/write',
         'Microsoft.Insights/dataCollectionRuleAssociations/write'
     )
-    if (@($Answers.workloads | Where-Object profile -NE 'webServer').Count) { $actions += 'Microsoft.AzureStackHCI/virtualHardDisks/write' }
+    if (@($Answers.workloads | ForEach-Object { Get-WorkloadDisks $_ }).Count) { $actions += 'Microsoft.AzureStackHCI/virtualHardDisks/write' }
     Assert-DeploymentPermissions $rgId $actions
     $cluster = Get-ArmResource $Answers.stamp.clusterResourceId
     Assert-ReadyResource $cluster '' $Answers.location
@@ -422,8 +542,8 @@ function Invoke-WorkloadPreflight {
             if (($group.location -replace '\s', '') -ne $Answers.location) { throw 'Reused image resource group must be in the stamp region.' }
         }
     }
-    if (@($plan | Where-Object import).Count) {
-        Assert-DeploymentPermissions $rgId @('Microsoft.AzureStackHCI/marketplaceGalleryImages/write')
+    foreach ($imageType in @($plan | Where-Object import | ForEach-Object { ($_.imageId -split '/')[-2] } | Sort-Object -Unique)) {
+        Assert-DeploymentPermissions $rgId @("Microsoft.AzureStackHCI/$imageType/write")
     }
     foreach ($workload in $Answers.workloads) {
         $resolved = $plan | Where-Object workloadName -EQ $workload.name
@@ -440,9 +560,12 @@ function Invoke-WorkloadPreflight {
                 Assert-VmMatchesConfiguration $vm $workload $resolved.imageId $rgId
             }
         }
-        if ($workload.profile -ne 'webServer') {
-            $disk = Get-ArmResource "$rgId/providers/Microsoft.AzureStackHCI/virtualHardDisks/$($workload.name)-data" -AllowNotFound
+        foreach ($diskDefinition in @(Get-WorkloadDisks $workload)) {
+            $disk = Get-ArmResource "$rgId/providers/Microsoft.AzureStackHCI/virtualHardDisks/$($workload.name)-$($diskDefinition.role)" -AllowNotFound
             Assert-OwnedResource $disk $Answers.deploymentName $hash
+            if ($null -ne $disk -and ($disk.properties.diskSizeGB -ne $diskDefinition.sizeGB -or $disk.properties.containerId -ne $Answers.storageContainerId)) {
+                throw 'Existing data disk has size or storage-path drift. No disk resizing or replacement is performed.'
+            }
         }
     }
     $plan
@@ -469,31 +592,75 @@ function Import-MissingImages {
         # Re-read immediately before creation: never replace an image created since preflight.
         $existing = Get-ArmResource $item.imageId -AllowNotFound
         if ($null -ne $existing) { throw 'Image appeared after preflight. Rerun preflight; it was not overwritten.' }
+        $isMarketplace = $item.definition.source -eq 'marketplace'
         $body = @{
             location = $Answers.location
             extendedLocation = @{ type = 'CustomLocation'; name = $Answers.stamp.customLocationId }
             properties = @{
                 containerId = $Answers.storageContainerId
-                osType = 'Windows'; hyperVGeneration = 'V2'
-                identifier = @{ publisher = $item.definition.publisher; offer = $item.definition.offer; sku = $item.definition.sku }
-                version = @{ name = $item.definition.version }
+                osType = if ($isMarketplace) { 'Windows' } else { 'Linux' }
+                hyperVGeneration = 'V2'
             }
         }
-        $null = Invoke-ArmRequest -Method PUT -Path "$($item.imageId)?api-version=2024-01-01" -Body $body -CreateOnly
-        $image = Wait-ArmResource $item.imageId '2024-01-01' $TimeoutSeconds
-        Assert-ReadyResource $image $Answers.stamp.customLocationId $Answers.location
-        if ($image.properties.osType -ne 'Windows' -or $image.properties.hyperVGeneration -ne 'V2' -or
-            $image.properties.version.name -ne $item.definition.version -or
-            $image.properties.identifier.publisher -ne $item.definition.publisher -or
-            $image.properties.identifier.offer -ne $item.definition.offer -or
-            $image.properties.identifier.sku -ne $item.definition.sku) {
-            throw 'Imported image metadata does not match the requested pinned image. VM deployment was not started.'
+        if ($isMarketplace) {
+            $body.properties.identifier = @{ publisher = $item.definition.publisher; offer = $item.definition.offer; sku = $item.definition.sku }
+            $body.properties.version = @{ name = $item.definition.version }
+        } else {
+            $body.properties.cloudInitDataSource = 'NoCloud'
+            $body.properties.imagePath = Get-PreparedImagePath $item.definition
+            $body.tags = @{ preparedImageSha256 = $item.definition.sha256.ToLowerInvariant() }
+        }
+        try {
+            $null = Invoke-ArmRequest -Method PUT -Path "$($item.imageId)?api-version=2024-01-01" -Body $body -CreateOnly
+            $image = Wait-ArmResource $item.imageId '2024-01-01' $TimeoutSeconds
+            Assert-ReadyResource $image $Answers.stamp.customLocationId $Answers.location
+            if ($image.properties.osType -ne $body.properties.osType -or $image.properties.hyperVGeneration -ne 'V2') {
+                throw 'Imported image metadata does not match the requested OS/generation. VM deployment was not started.'
+            }
+            if ($isMarketplace) {
+                if ($image.properties.version.name -ne $item.definition.version -or
+                    $image.properties.identifier.publisher -ne $item.definition.publisher -or
+                    $image.properties.identifier.offer -ne $item.definition.offer -or
+                    $image.properties.identifier.sku -ne $item.definition.sku) {
+                    throw 'Imported image metadata does not match the requested pinned image. VM deployment was not started.'
+                }
+            } elseif ($image.properties['cloudInitDataSource'] -ne 'NoCloud' -or
+                !$image['tags'] -or $image.tags['preparedImageSha256'] -ne $item.definition.sha256) {
+                throw 'Imported prepared image is missing its NoCloud setting or source digest. VM deployment was not started.'
+            }
+        } finally {
+            $body = $null
         }
     }
 }
 
+function Get-PreparedImagePath {
+    param([hashtable]$Image)
+    if ($Image.source -eq 'local') { return $Image.path }
+    $token = [Environment]::GetEnvironmentVariable($Image.sasTokenEnvironmentVariable, 'Process')
+    if (!$token) { throw 'Prepared image SAS environment variable is empty or missing. No image was imported.' }
+    try {
+        $token = $token.TrimStart('?')
+        $fields = @{}
+        foreach ($part in $token.Split('&')) {
+            $pair = $part.Split('=', 2)
+            if ($pair.Count -ne 2 -or $fields.ContainsKey($pair[0]) -or $pair[1] -match '[\s#]') { throw 'Invalid SAS.' }
+            $fields[$pair[0]] = [uri]::UnescapeDataString($pair[1])
+        }
+        $expires = [DateTimeOffset]::MinValue
+        if (!$fields['sig'] -or $fields['sr'] -ne 'b' -or $fields['spr'] -ne 'https' -or
+            $fields['sp'] -notmatch '^r(l)?$' -or
+            ![DateTimeOffset]::TryParse($fields['se'], [ref]$expires) -or $expires -le [DateTimeOffset]::UtcNow) {
+            throw 'Invalid SAS.'
+        }
+        "$($Image.uri)?$token"
+    } catch { throw 'Prepared image SAS must be an unexpired HTTPS-only, blob-scoped, read-only token; its value is not logged.' }
+    finally { $token = $null; $fields = $null }
+}
+
 function Get-GuestSettings {
     param([hashtable]$Answers, [hashtable]$Workload)
+    if ($Workload.profile -in @('windowsApp', 'linuxApp')) { return @{} }
     $config = @{ profile = $Workload.profile; adminUsername = $Answers.adminUsername; allowedCidrs = $Workload.allowedCidrs }
     if ($Workload.profile -eq 'webServer') {
         $scriptText = Get-Content -LiteralPath (Join-Path $script:Root 'guest\configure-nginx.sh') -Raw
@@ -502,7 +669,7 @@ function Get-GuestSettings {
         return @{ script = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($scriptText -replace "`r`n", "`n"))) }
     }
     $config.dataDiskSizeGB = $Workload.dataDiskSizeGB
-    $config[$Workload.profile] = $Workload[$Workload.profile]
+    if ($Workload.profile -in @('fileServer', 'sqlServer')) { $config[$Workload.profile] = $Workload[$Workload.profile] }
     $encodedConfig = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($config | ConvertTo-Json -Depth 10 -Compress)))
     $artifact = Get-WindowsGuestArtifact
     $bootstrap = "`$ErrorActionPreference='Stop';if((Get-FileHash -LiteralPath '.\Configure-Windows.ps1' -Algorithm SHA256).Hash -ne '$($artifact.sha256)'){throw 'Guest script checksum mismatch'};& '.\Configure-Windows.ps1' -ConfigurationBase64 '$encodedConfig'"
@@ -556,7 +723,7 @@ function Assert-PublicGuestArtifact {
 
 function Get-PasswordParameter {
     param([hashtable]$Answers)
-    if (!@($Answers.workloads | Where-Object profile -NE 'webServer').Count) { return @{ value = '' } }
+    if (!@($Answers.workloads | Where-Object { !(Test-LinuxProfile $_) }).Count) { return @{ value = '' } }
     $source = $Answers.passwordSource
     if ($source.type -eq 'keyVault') {
         return @{ reference = @{ keyVault = @{ id = $source.vaultResourceId }; secretName = $source.secretName; secretVersion = $source.secretVersion } }
@@ -600,14 +767,18 @@ function Start-WorkloadDeployment {
         [ValidateRange(60, 21600)][int]$TimeoutSeconds = 10800
     )
     $answers = Read-WorkloadAnswers $AnswerFile
+    $summary = Get-WorkloadSummary $answers.workloads
+    Write-Output ("Plan: {0} VMs, {1} vCPU, {2} MiB RAM, {3} data disks / {4} GiB. OS-disk suggestions: {5} GiB ({6} unspecified); actual OS capacity is inherited from images, not resized." -f
+        $summary.vmCount, $summary.processors, $summary.memoryMB, $summary.dataDiskCount, $summary.dataDiskGB, $summary.suggestedOsDiskGB, $summary.unspecifiedOsDiskCount)
     if ($Mode -eq 'Validate') { Write-Output 'Answer file is valid. Offline only; Azure resources, capacity, RBAC and guest readiness have not been checked.'; return }
+    if (!$answers.workloads.Count) { Write-Output 'All workload counts are zero. No Azure connection, imports, password reads or deployments were performed.'; return }
     try {
         Open-ArmConnection $answers.subscriptionId
         $plan = @(Invoke-WorkloadPreflight $answers)
-        $plan | ForEach-Object { Write-Output "$($_.workloadName): $(if ($_.import) { 'import missing Windows Marketplace image' } else { 'reuse existing image' })" }
+        $plan | ForEach-Object { Write-Output "$($_.workloadName): $(if ($_.import) { 'import missing image' } else { 'reuse existing image' })" }
         if ($Mode -eq 'Preflight' -or !$PSCmdlet.ShouldProcess($answers.resourceGroup, 'Import missing images and deploy Arc-enabled workloads and billable monitoring')) { return }
         $template = Get-CompiledTemplate
-        if (@($answers.workloads | Where-Object profile -NE 'webServer').Count) {
+        if (@($answers.workloads | Where-Object profile -In @('fileServer', 'sqlServer', 'iisServer')).Count) {
             Assert-PublicGuestArtifact (Get-WindowsGuestArtifact)
         }
         $resolved = @()
@@ -617,6 +788,9 @@ function Start-WorkloadDeployment {
                 name = $workload.name; profile = $workload.profile
                 processors = $workload.processors; memoryMB = $workload.memoryMB
                 dataDiskSizeGB = $workload['dataDiskSizeGB']
+                dataDisks = @(Get-WorkloadDisks $workload)
+                isLinux = Test-LinuxProfile $workload
+                configureGuest = $workload.profile -notin @('windowsApp', 'linuxApp')
                 privateIpAddress = if ($workload.ContainsKey('privateIpAddress')) { $workload.privateIpAddress } else { '' }
                 sshPublicKey = if ($workload.ContainsKey('sshPublicKey')) { $workload.sshPublicKey } else { '' }
                 imageId = $image.imageId
@@ -641,7 +815,7 @@ function Start-WorkloadDeployment {
         $body = @{ properties = @{ mode = 'Incremental'; template = $template; parameters = $parameters } }
         $null = Invoke-ArmRequest -Method PUT -Path "${deploymentId}?api-version=2022-09-01" -Body $body
         $null = Wait-ArmResource $deploymentId '2022-09-01' $TimeoutSeconds
-        Write-Output "Deployment succeeded: $($answers.deploymentName). Guest scripts and AMA/DCR provisioning completed; verify remote client access and workspace ingestion separately."
+        Write-Output "Deployment succeeded: $($answers.deploymentName). Requested VM/extensions/monitoring provisioning completed; base profiles do not install applications. Verify remote client access and workspace ingestion separately."
     } finally {
         $parameters = $null
         $body = $null

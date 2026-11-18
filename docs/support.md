@@ -11,6 +11,7 @@ Documentation reviewed: 2026-11-17. Vendor support evolves; verify the current r
 | `Microsoft.AzureStackHCI/networkInterfaces` | `2024-01-01` | Existing logical network; optional explicit static IP |
 | `Microsoft.AzureStackHCI/virtualHardDisks` | `2024-01-01` | Dedicated data disk on the selected storage container |
 | `Microsoft.AzureStackHCI/marketplaceGalleryImages` | `2024-01-01` | Exact Windows publisher/offer/SKU/version import |
+| `Microsoft.AzureStackHCI/galleryImages` | `2024-01-01` | Prepared NoCloud Ubuntu image import from stamp CSV VHDX or Storage page blob |
 | `Microsoft.Insights/dataCollectionRules` and `/dataCollectionRuleAssociations` | `2023-03-11` | OS logs to the existing workspace |
 | `Microsoft.Resources/deployments` | `2022-09-01` | Incremental deployment with in-memory secure parameters |
 
@@ -23,6 +24,9 @@ Stable APIs are deliberately preferred over newly introduced preview features. T
 - [Network interface schema](https://learn.microsoft.com/azure/templates/microsoft.azurestackhci/2024-01-01/networkinterfaces)
 - [Logical network schema, IP allocation method and VM pools](https://learn.microsoft.com/azure/templates/microsoft.azurestackhci/2024-01-01/logicalnetworks)
 - [Marketplace gallery image schema](https://learn.microsoft.com/azure/templates/microsoft.azurestackhci/2024-01-01/marketplacegalleryimages)
+- [Custom gallery image schema: `imagePath` and `cloudInitDataSource`](https://learn.microsoft.com/azure/templates/microsoft.azurestackhci/2024-01-01/galleryimages)
+- [Prepared image import from a local share/cluster shared volume](https://learn.microsoft.com/azure/azure-local/manage/virtual-machine-image-local-share)
+- [Prepared image import from Azure Storage: page blobs and SAS URLs](https://learn.microsoft.com/azure/azure-local/manage/virtual-machine-image-storage-account)
 - [Windows Marketplace image import, supported image catalog and provider prerequisites](https://learn.microsoft.com/azure/azure-local/manage/virtual-machine-image-azure-marketplace)
 - [Ubuntu Marketplace image preparation: generalized image, NoCloud and custom import](https://learn.microsoft.com/azure/azure-local/manage/virtual-machine-azure-marketplace-ubuntu)
 - [Azure Local VM extension support and guest-management prerequisite](https://learn.microsoft.com/azure/azure-local/manage/virtual-machine-manage-extension)
@@ -38,6 +42,8 @@ Stable APIs are deliberately preferred over newly introduced preview features. T
 
 ## Required live acceptance before releasing production support
 
-In an explicitly authorized disposable environment: run each profile separately, then together; exercise DHCP and static IPs; prove image reuse and missing-Windows-image import; confirm clean guest onboarding, disk identity, extension readiness and local/client service access; rerun without data loss; inject a guest failure and inspect partial state; verify AMA heartbeat and OS logs in the actual workspace. Test scoped firewall/HTTP denials from a second client. Confirm Windows and SQL licensing and validate backup/restore separately.
+In an explicitly authorized disposable environment: run each of the six profiles separately, then together with counts greater than one; exercise DHCP and per-instance static IPs; prove Marketplace and digest-based custom image reuse plus missing Windows/CSV/blob image imports; verify expired/unreachable source failures and timeout behavior; confirm clean guest onboarding, safe disk identity, extension readiness and local/client service access; verify base-profile disks stay RAW and no application is claimed; rerun and increase/decrease counts without renaming or deleting existing resources; inject a guest failure and inspect partial state; verify AMA heartbeat and OS logs in the actual workspace. Test scoped IIS/firewall and Nginx HTTP denials from a second client. Confirm Windows and SQL licensing, actual OS-disk sizes and backup/restore separately. None of these live acceptance checks has been performed by the offline suite.
+
+The stable VM schema has no image-based OS disk size override. `suggestedOsDiskSizeGB` is explicitly advisory; the launcher only applies CPU, RAM and data-disk sizes, and does not perform OS-disk resizing. CSV input is intentionally narrower than general share-path syntax: only stamp cluster shared volume VHDX paths are accepted. Blob import supports Azure public-cloud Storage page blobs using read-only SAS tokens supplied at runtime, not credentials in answer files. The digest tag records the operator's attestation, not a checksum independently verified by the provider.
 
 Do not silently expand the image allowlist or use generic Azure IaaS URNs. If a desired guest image cannot use supported zero-touch Arc onboarding, stop and document the preparation gap rather than presenting an empty VM as a configured workload.

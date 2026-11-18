@@ -17,10 +17,12 @@
   "logAnalyticsWorkspaceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-monitor/providers/Microsoft.OperationalInsights/workspaces/workload-logs",
   "workloads": [
     {
-      "name": "files-01",
+      "name": "files",
+      "count": 1,
       "profile": "fileServer",
       "processors": 2,
       "memoryMB": 4096,
+      "suggestedOsDiskSizeGB": 128,
       "dataDiskSizeGB": 128,
       "allowedCidrs": ["10.40.0.0/24"],
       "image": {
@@ -36,10 +38,12 @@
       "fileServer": { "shareName": "Department" }
     },
     {
-      "name": "sql-01",
+      "name": "sql",
+      "count": 0,
       "profile": "sqlServer",
       "processors": 4,
       "memoryMB": 8192,
+      "suggestedOsDiskSizeGB": 128,
       "dataDiskSizeGB": 128,
       "allowedCidrs": ["10.40.0.0/24"],
       "image": {
@@ -60,16 +64,82 @@
       }
     },
     {
-      "name": "web-01",
+      "name": "web",
+      "count": 0,
       "profile": "webServer",
       "processors": 2,
       "memoryMB": 2048,
+      "suggestedOsDiskSizeGB": 64,
       "allowedCidrs": ["10.40.0.0/24"],
-      "sshPublicKey": "ssh-rsa REPLACE_WITH_YOUR_RSA_2048_OR_LARGER_PUBLIC_KEY",
+      "sshPublicKey": "ssh-rsa AAAA",
       "image": {
-        "source": "existing",
+        "source": "local",
         "os": "Ubuntu2204",
-        "resourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-workloads/providers/Microsoft.AzureStackHCI/galleryImages/ubuntu-2204-prepared",
+        "name": "ubuntu-2204-prepared",
+        "path": "C:\\ClusterStorage\\Volume1\\Images\\ubuntu-2204-nocloud.vhdx",
+        "stampPathConfirmed": true,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "preparedImageConfirmed": true
+      }
+    },
+    {
+      "name": "iis",
+      "count": 0,
+      "profile": "iisServer",
+      "processors": 2,
+      "memoryMB": 4096,
+      "suggestedOsDiskSizeGB": 128,
+      "dataDiskSizeGB": 64,
+      "allowedCidrs": ["10.40.0.0/24"],
+      "image": {
+        "source": "marketplace",
+        "os": "WindowsServer2022",
+        "name": "windows-2022-approved",
+        "publisher": "microsoftwindowsserver",
+        "offer": "windowsserver",
+        "sku": "2022-datacenter-azure-edition",
+        "version": "20348.2461.240510",
+        "licenseAndMarketplaceTermsConfirmed": true
+      }
+    },
+    {
+      "name": "winapp",
+      "count": 0,
+      "profile": "windowsApp",
+      "processors": 2,
+      "memoryMB": 4096,
+      "suggestedOsDiskSizeGB": 128,
+      "dataDisks": [{ "role": "appdata", "sizeGB": 64 }],
+      "allowedCidrs": ["10.40.0.0/24"],
+      "image": {
+        "source": "marketplace",
+        "os": "WindowsServer2022",
+        "name": "windows-2022-approved",
+        "publisher": "microsoftwindowsserver",
+        "offer": "windowsserver",
+        "sku": "2022-datacenter-azure-edition",
+        "version": "20348.2461.240510",
+        "licenseAndMarketplaceTermsConfirmed": true
+      }
+    },
+    {
+      "name": "linuxapp",
+      "count": 0,
+      "profile": "linuxApp",
+      "processors": 2,
+      "memoryMB": 2048,
+      "suggestedOsDiskSizeGB": 64,
+      "dataDisks": [{ "role": "appdata", "sizeGB": 64 }, { "role": "logs", "sizeGB": 32 }],
+      "allowedCidrs": ["10.40.0.0/24"],
+      "sshPublicKey": "ssh-rsa AAAA",
+      "image": {
+        "source": "blob",
+        "os": "Ubuntu2204",
+        "name": "ubuntu-2204-from-blob",
+        "uri": "https://preparedimages.blob.core.windows.net/images/ubuntu-2204-nocloud.vhd",
+        "sasTokenEnvironmentVariable": "AZLOCAL_IMAGE_READ_SAS",
+        "pageBlobConfirmed": true,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
         "preparedImageConfirmed": true
       }
     }

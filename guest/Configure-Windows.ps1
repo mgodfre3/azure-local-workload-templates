@@ -39,7 +39,7 @@ function Read-WorkloadConfiguration([string]$Payload) {
         $c = $utf8.GetString($bytes) | ConvertFrom-Json -ErrorAction Stop
     } catch { throw 'ConfigurationBase64 must contain valid UTF8 JSON.' }
     Assert-Keys $c @('profile', 'adminUsername', 'allowedCidrs', 'dataDiskSizeGB', 'fileServer', 'sqlServer')
-    if ($c.profile -cnotin @('fileServer', 'sqlServer') -or
+    if ($c.profile -cnotin @('fileServer', 'sqlServer', 'iisServer') -or
         $c.adminUsername -cnotmatch '^[A-Za-z][A-Za-z0-9_-]{0,19}$' -or
         ($c.dataDiskSizeGB -isnot [int] -and $c.dataDiskSizeGB -isnot [long]) -or
         $c.dataDiskSizeGB -lt 1 -or $c.dataDiskSizeGB -gt 32767 -or
@@ -56,7 +56,7 @@ function Read-WorkloadConfiguration([string]$Payload) {
         Assert-Keys $c.fileServer @('shareName')
         if ($c.fileServer.shareName -cnotmatch '^[A-Za-z][A-Za-z0-9_-]{0,63}$' -or
             $c.fileServer.shareName -in @('ADMIN', 'IPC', 'print')) { throw 'Invalid SMB share name.' }
-    } else {
+    } elseif ($c.profile -eq 'sqlServer') {
         Assert-Keys $c.sqlServer @('installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed')
         $s = $c.sqlServer
         if ($s.edition -cnotin @('Developer', 'Evaluation')) { throw 'Only SQL Developer or Evaluation is supported; paid editions are not automated.' }
@@ -68,6 +68,8 @@ function Read-WorkloadConfiguration([string]$Payload) {
         if ($s.installerSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'A SHA256 media checksum is required.' }
         $null = Assert-MediaUrl $s.installerUrl
     }
+    if (($c.profile -ne 'fileServer' -and $null -ne $c.fileServer) -or
+        ($c.profile -ne 'sqlServer' -and $null -ne $c.sqlServer)) { throw 'Profile settings do not match the requested service.' }
     return $c
 }
 
@@ -224,6 +226,46 @@ function Set-FileServer($Config, $Admin) {
     $access = @(Get-SmbShareAccess -Name $Config.fileServer.shareName)
     if (!$actual.EncryptData -or $access.Count -ne 1 -or $access[0].AccountName -ne $account -or $access[0].AccessRight -ne 'Full') { throw 'SMB verification failed.' }
     Set-WorkloadFirewall 445 $Config.allowedCidrs
+}
+
+function Assert-IisLayout($Sites, $Bindings) {
+    if ($Sites.Count -ne 1 -or $Sites[0].Name -ne 'Default Web Site') { throw 'Expected only the default IIS site; refusing to alter other sites.' }
+    if ($Bindings.Count -ne 1 -or $Bindings[0].protocol -ne 'http' -or
+        $Bindings[0].bindingInformation -ne '*:80:') { throw 'Unexpected IIS bindings; refusing to change them.' }
+    if ($Sites[0].physicalPath -notin @('%SystemDrive%\inetpub\wwwroot', 'C:\inetpub\wwwroot', 'E:\Iis')) { throw 'Unexpected IIS site content path.' }
+}
+
+function Set-IisServer($Config) {
+    $feature = Install-WindowsFeature Web-Server
+    # Replace only the role's built-in network openings with the scoped rule below.
+    Get-NetFirewallRule -PolicyStore PersistentStore |
+        Where-Object Name -in @('IIS-WebServerRole-HTTP-In-TCP', 'IIS-WebServerRole-HTTPS-In-TCP') |
+        Disable-NetFirewallRule | Out-Null
+    if (!$feature.Success -or $feature.RestartNeeded -ne 'No') { throw 'IIS role requires a restart or installation failed; rerun after manual recovery.' }
+    Import-Module WebAdministration -ErrorAction Stop
+    Assert-IisLayout @(Get-Website) @(Get-WebBinding -Name 'Default Web Site')
+    $path = 'E:\Iis'
+    Set-PrivateDirectory $path @()
+    # Anonymous IUSR and IIS workers get read-only access to site content.
+    $acl = Get-Acl -LiteralPath $path
+    foreach ($sid in @('S-1-5-17', 'S-1-5-32-568')) {
+        $reader = New-Object Security.Principal.SecurityIdentifier($sid)
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($reader, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    }
+    Set-Acl -LiteralPath $path -AclObject $acl
+    $index = Join-Path $path 'index.html'
+    $content = '<!doctype html><html lang="en"><title>Azure Local IIS</title><h1>Azure Local IIS reference workload</h1></html>'
+    if (Test-Path -LiteralPath $index) {
+        if ((Get-Item -LiteralPath $index -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
+            (Get-Content -LiteralPath $index -Raw).Trim() -ne $content) { throw 'IIS content collision; existing files were not overwritten.' }
+    } elseif (@(Get-ChildItem -LiteralPath $path -Force).Count) { throw 'IIS content directory is not empty.' }
+    else { Set-Content -LiteralPath $index -Value $content -Encoding ASCII }
+    Set-ItemProperty 'IIS:\Sites\Default Web Site' -Name physicalPath -Value $path
+    Set-WorkloadFirewall 80 $Config.allowedCidrs
+    Start-Service W3SVC
+    Start-WebSite -Name 'Default Web Site'
+    $response = Invoke-WebRequest 'http://localhost/' -UseBasicParsing -TimeoutSec 30
+    if ($response.StatusCode -ne 200 -or $response.Content.Trim() -ne $content) { throw 'IIS local HTTP readiness failed.' }
 }
 
 function Get-SqlResult([string]$Query, [string]$Server = 'lpc:.') {
@@ -404,10 +446,14 @@ function Invoke-WorkloadConfiguration([string]$Payload) {
     $admin = Get-LocalUser -Name $c.adminUsername
     $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544')
     if (!$admin.Enabled -or $admin.SID.Value -notin $members.SID.Value) { throw 'adminUsername must be an enabled local Administrator.' }
-    $port = if ($c.profile -eq 'fileServer') { 445 } else { 1433 }
+    $port = switch ($c.profile) { 'fileServer' { 445 } 'sqlServer' { 1433 } 'iisServer' { 80 } }
     Assert-ScopedFirewall $port $c.allowedCidrs
     Initialize-WorkloadData $c.dataDiskSizeGB
-    if ($c.profile -eq 'fileServer') { Set-FileServer $c $admin } else { Set-SqlServer $c $admin }
+    switch ($c.profile) {
+        'fileServer' { Set-FileServer $c $admin }
+        'sqlServer' { Set-SqlServer $c $admin }
+        'iisServer' { Set-IisServer $c }
+    }
     Assert-NoRestart
     Write-Output 'Workload configuration verified.'
 }

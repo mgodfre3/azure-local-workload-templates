@@ -43,6 +43,27 @@ Describe 'Windows guest script' {
     }
 }
 
+Describe 'IIS site safety' {
+    BeforeEach {
+        $sites = @([pscustomobject]@{ Name = 'Default Web Site'; physicalPath = '%SystemDrive%\inetpub\wwwroot' })
+        $bindings = @([pscustomobject]@{ protocol = 'http'; bindingInformation = '*:80:' })
+    }
+    It 'accepts only the default site or its managed content path' {
+        { Assert-IisLayout $sites $bindings } | Should -Not -Throw
+        $sites[0].physicalPath = 'E:\Iis'
+        { Assert-IisLayout $sites $bindings } | Should -Not -Throw
+    }
+    It 'refuses other sites, additional bindings and existing custom content locations' {
+        { Assert-IisLayout @($sites[0], $sites[0]) $bindings } | Should -Throw '*only the default*'
+        { Assert-IisLayout $sites @($bindings[0], $bindings[0]) } | Should -Throw '*bindings*'
+        $bindings[0].bindingInformation = '*:8080:'
+        { Assert-IisLayout $sites $bindings } | Should -Throw '*bindings*'
+        $bindings[0].bindingInformation = '*:80:'
+        $sites[0].physicalPath = 'E:\CustomerSite'
+        { Assert-IisLayout $sites $bindings } | Should -Throw '*content path*'
+    }
+}
+
 Describe 'Safe workload disk selection (pure inventory)' {
     BeforeEach {
         $disk = [pscustomobject]@{ Number = 1; Size = 128GB; IsBoot = $false; IsSystem = $false; PartitionStyle = 'RAW' }
@@ -104,6 +125,15 @@ Describe 'Safe workload disk selection (pure inventory)' {
 }
 
 Describe 'Workload payload and licensing validation' {
+    It 'accepts IIS without unrelated SQL or file-server settings and rejects cross-profile settings' {
+        $c = New-Config
+        $c.profile = 'iisServer'
+        $c.Remove('fileServer')
+        (Read-WorkloadConfiguration (New-Payload $c)).profile | Should -Be iisServer
+        $c.fileServer = @{ shareName = 'Unexpected' }
+        { Read-WorkloadConfiguration (New-Payload $c) } | Should -Throw '*do not match*'
+    }
+
     It 'accepts UTF8 base64 JSON and both supported nonproduction SQL editions' {
         (Read-WorkloadConfiguration (New-Payload (New-Config))).profile | Should -Be 'fileServer'
         foreach ($edition in @('Developer', 'Evaluation')) {
