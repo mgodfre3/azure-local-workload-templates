@@ -21,11 +21,15 @@ for keys in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
         fail "inherited SSH login keys require image preparation"
     fi
 done
-sshd_config=$(/usr/sbin/sshd -T -C "user=$user,host=localhost,addr=127.0.0.1")
-printf '%s\n' "$sshd_config" | grep -qx 'passwordauthentication no' || fail "SSH password authentication is enabled"
-printf '%s\n' "$sshd_config" | grep -qx 'kbdinteractiveauthentication no' || fail "SSH interactive authentication is enabled"
 [ "$(passwd -S "$user" | awk '{print $2}')" = L ] || fail "administrator has an inherited password"
 [ "$(passwd -S root | awk '{print $2}')" = L ] || fail "root has an inherited password"
+if ! systemctl is-active --quiet ssh; then
+    systemctl is-active --quiet ssh.socket || fail "SSH service and socket are not active"
+    timeout 30 systemctl start ssh || fail "SSH socket-backed service could not start"
+fi
+sshd_config=$(/usr/sbin/sshd -T -C "user=$user,host=localhost,addr=127.0.0.1") || fail "effective SSH configuration could not be validated"
+printf '%s\n' "$sshd_config" | grep -qx 'passwordauthentication no' || fail "SSH password authentication is enabled"
+printf '%s\n' "$sshd_config" | grep -qx 'kbdinteractiveauthentication no' || fail "SSH interactive authentication is enabled"
 [ -s /etc/machine-id ] || fail "machine identity is missing"
 systemctl is-active --quiet ssh || fail "SSH is not active"
 echo "Linux guest acceptance passed: expected Ubuntu, NoCloud/cloud-init, requested SSH key and password-disabled login. Source preparation provenance is not certified."

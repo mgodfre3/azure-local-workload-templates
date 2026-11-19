@@ -6,7 +6,8 @@ BeforeAll {
         param(
             [string]$Version = '24.04', [string]$ExpectedVersion = '24.04',
             [int]$CloudExit = 0, [string]$CloudId = 'nocloud',
-            [switch]$WrongKey, [switch]$InheritedKey, [switch]$PasswordEnabled
+            [switch]$WrongKey, [switch]$InheritedKey, [switch]$PasswordEnabled,
+            [switch]$SocketOnly, [switch]$SshInactive, [switch]$StartFailure, [switch]$UnlockedPassword
         )
         $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
         $etc = Join-Path $root 'etc'
@@ -24,11 +25,23 @@ cloud-init() { return __CLOUD_EXIT__; }
 cloud-id() { echo '__CLOUD_ID__'; }
 timeout() { shift; "$@"; }
 getent() { echo 'vmadmin:x:1000:1000::__ROOT__/home/vmadmin:/bin/bash'; }
-passwd() { echo "$2 L"; }
+passwd() { echo "$2 __ACCOUNT_LOCK__"; }
 sshd() { printf 'passwordauthentication __PASSWORD__\nkbdinteractiveauthentication no\n'; }
-systemctl() { return 0; }
+ssh_active=__SSH_ACTIVE__
+systemctl() {
+    case "$1:${3-}" in
+        is-active:ssh) return "$ssh_active" ;;
+        is-active:ssh.socket) return __SOCKET_EXIT__ ;;
+        start:) printf 'ssh-start-attempted\n'; ssh_active=0; return __START_EXIT__ ;;
+        *) return 1 ;;
+    esac
+}
 '@.Replace('__CLOUD_EXIT__', "$CloudExit").Replace('__CLOUD_ID__', $CloudId).
-            Replace('__ROOT__', $unixRoot).Replace('__PASSWORD__', $(if ($PasswordEnabled) { 'yes' } else { 'no' }))
+            Replace('__ROOT__', $unixRoot).Replace('__PASSWORD__', $(if ($PasswordEnabled) { 'yes' } else { 'no' })).
+            Replace('__SSH_ACTIVE__', $(if ($SocketOnly -or $SshInactive) { '1' } else { '0' })).
+            Replace('__SOCKET_EXIT__', $(if ($SshInactive) { '1' } else { '0' })).
+            Replace('__START_EXIT__', $(if ($StartFailure) { '1' } else { '0' })).
+            Replace('__ACCOUNT_LOCK__', $(if ($UnlockedPassword) { 'P' } else { 'L' }))
         $body = $validator.Replace('/etc/', "$unixRoot/etc/").Replace('/home/', "$unixRoot/home/").
             Replace('/root/', "$unixRoot/root/").Replace('/usr/sbin/sshd', 'sshd').
             Replace('__ADMIN_USERNAME__', 'vmadmin').Replace('__UBUNTU_VERSION__', $ExpectedVersion).
@@ -57,5 +70,26 @@ Describe 'Linux guest acceptance (isolated Bash fixtures)' {
         (Invoke-LinuxAcceptance -WrongKey).Output | Should -Match 'SSH keys differ'
         (Invoke-LinuxAcceptance -InheritedKey).Output | Should -Match 'inherited SSH login keys'
         (Invoke-LinuxAcceptance -PasswordEnabled).Output | Should -Match 'password authentication is enabled'
+    }
+    It 'supports an already listening SSH socket without enabling a closed endpoint or ignoring startup failure' {
+        $result = Invoke-LinuxAcceptance -SocketOnly
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'ssh-start-attempted'
+        $result = Invoke-LinuxAcceptance -SshInactive
+        $result.ExitCode | Should -Be 1
+        $result.Output | Should -Not -Match 'ssh-start-attempted'
+        (Invoke-LinuxAcceptance -SocketOnly -StartFailure).Output | Should -Match 'could not start'
+    }
+    It 'never activates socket-backed SSH before clean cloud-init, key and password checks' {
+        $result = Invoke-LinuxAcceptance -SocketOnly -CloudExit 2
+        $result.ExitCode | Should -Be 1
+        $result.Output | Should -Not -Match 'ssh-start-attempted'
+        $result = Invoke-LinuxAcceptance -SocketOnly -InheritedKey
+        $result.ExitCode | Should -Be 1
+        $result.Output | Should -Not -Match 'ssh-start-attempted'
+        $result = Invoke-LinuxAcceptance -SocketOnly -UnlockedPassword
+        $result.ExitCode | Should -Be 1
+        $result.Output | Should -Not -Match 'ssh-start-attempted'
+        (Invoke-LinuxAcceptance -SocketOnly -PasswordEnabled).ExitCode | Should -Be 1
     }
 }
