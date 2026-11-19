@@ -57,7 +57,7 @@ resource collection 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
         {
           name: 'operatingSystem'
           streams: [
-            'Microsoft-WindowsEvent'
+            'Microsoft-Event'
           ]
           xPathQueries: [
             'System!*[System[(Level=1 or Level=2 or Level=3)]]'
@@ -77,7 +77,7 @@ resource collection 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
     dataFlows: [
       {
         streams: [
-          isLinux ? 'Microsoft-Syslog' : 'Microsoft-WindowsEvent'
+          isLinux ? 'Microsoft-Syslog' : 'Microsoft-Event'
         ]
         destinations: [
           'defaultWorkspace'

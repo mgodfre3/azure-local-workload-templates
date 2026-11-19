@@ -4,6 +4,8 @@ Documentation reviewed: 2026-11-17. Vendor support evolves; verify the current r
 
 Windows Server 2025 is an explicit **existing-image** alternative for Windows profiles; Windows Server 2022 remains the default and the only automated Marketplace import. The guest guard accepts server builds 20348 and 26100 and rejects workstation editions. Microsoft lists Windows Server 2025 Datacenter: Azure Edition in the [SQL Server 2022 OS support matrix](https://learn.microsoft.com/sql/sql-server/install/hardware-and-software-requirements-for-installing-sql-server-2022#operating-system-support). This is an offline-tested compatibility boundary, not evidence that any particular image, SMB/IIS/SQL service or monitoring enrollment has passed live acceptance.
 
+Windows OS logs use the standard `Microsoft-Event` input/data-flow stream and the workspace's `Event` table, as documented in the [Azure Monitor DCR sample](https://learn.microsoft.com/azure/azure-monitor/data-collection/data-collection-rule-samples#windows-events). `Microsoft-WindowsEvent` targets a different table and must not be substituted; a workspace without that table rejects the DCR with `InvalidOutputTable`. Do not create a different destination table to mask an incorrect stream name.
+
 The existing Log Analytics workspace can be in another region in the same subscription. Each new DCR derives its location from that workspace, while AMA stays in the VM region; the existing destination and its resource group are not relocated. This follows the [Azure Monitor DCR region requirement](https://learn.microsoft.com/azure/azure-monitor/vm/data-collection#create-data-collection-rule-dcr). Private Link/AMPLS remains outside this implementation.
 
 ## Pinned resource APIs

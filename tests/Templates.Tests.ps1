@@ -79,4 +79,12 @@ Describe 'Compiled ARM deployment contract' {
         $extension = @($monitoring.resources | Where-Object type -EQ 'Microsoft.HybridCompute/machines/extensions')[0]
         $extension.location | Should -Be "[parameters('location')]"
     }
+
+    It 'routes Windows warning/error collection to the standard Event table stream' {
+        $rule = @($monitoring.resources | Where-Object type -EQ 'Microsoft.Insights/dataCollectionRules')[0]
+        $sources = $rule.properties.dataSources | ConvertTo-Json -Depth 20
+        $sources | Should -Match 'Microsoft-Event'
+        $sources | Should -Not -Match 'Microsoft-WindowsEvent'
+        $rule.properties.dataFlows[0].streams[0] | Should -Be "[if(parameters('isLinux'), 'Microsoft-Syslog', 'Microsoft-Event')]"
+    }
 }
