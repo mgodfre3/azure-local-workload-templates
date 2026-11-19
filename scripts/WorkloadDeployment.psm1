@@ -235,11 +235,20 @@ function Assert-Answers {
             $imageDefinitions[$image.name] = $definition
         }
         if ($workload.profile -eq 'sqlServer') {
-            $uri = [uri]$workload.sqlServer.installerUrl
-            if ($uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or
-                $uri.Host -match '(^|\.)example\.(org|com|net)$' -or
-                $workload.sqlServer.installerSha256 -match '^0{64}$') {
-                throw 'SQL requires a real HTTPS full-media ISO URL without credentials/query/fragment and its verified SHA256, not the example placeholders.'
+            if ($workload.sqlServer.ContainsKey('productKeySource')) {
+                $source = $workload.sqlServer.productKeySource
+                Assert-ResourceId $source.vaultResourceId 'Microsoft\.KeyVault/vaults' $sub
+                if ($source.vaultResourceId.Split('/')[-1] -notmatch '^[a-zA-Z][a-zA-Z0-9-]{1,22}[a-zA-Z0-9]$') {
+                    throw 'SQL product key requires a valid Azure public-cloud Key Vault name.'
+                }
+            }
+            if ($workload.sqlServer['installationMode'] -ne 'marketplace') {
+                $uri = [uri]$workload.sqlServer.installerUrl
+                if ($uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or
+                    $uri.Host -match '(^|\.)example\.(org|com|net)$' -or
+                    $workload.sqlServer.installerSha256 -match '^0{64}$') {
+                    throw 'SQL requires a real HTTPS full-media ISO URL without credentials/query/fragment and its verified SHA256, not the example placeholders.'
+                }
             }
         }
     }
@@ -414,6 +423,15 @@ function Get-ImagePlan {
             if ($os -eq 'Linux' -and $image.properties['cloudInitDataSource'] -and $image.properties.cloudInitDataSource -ne 'NoCloud') {
                 throw 'Ubuntu custom image declares a data source other than NoCloud.'
             }
+            $identifier = $image.properties['identifier']
+            $preinstalledSql = $workload.profile -eq 'sqlServer' -and $workload.sqlServer['installationMode'] -eq 'marketplace'
+            if ($preinstalledSql -and (!$identifier -or $identifier.publisher -ne 'microsoftsqlserver' -or
+                $identifier.offer -ne 'sql2022-ws2022' -or $identifier.sku -ne 'enterprise-gen2')) {
+                throw 'Marketplace SQL verification requires the exact microsoftsqlserver/sql2022-ws2022/enterprise-gen2 image; an OS-only image is not sufficient.'
+            }
+            if ($identifier -and $identifier.publisher -eq 'microsoftsqlserver' -and !$preinstalledSql) {
+                throw 'A preinstalled SQL image requires the explicitly licensed SQL marketplace installationMode; it cannot be used as an OS-only image or reinstalled through the ISO path.'
+            }
             $id = $image.id
         } else { $id = $targetId }
         $plan += @{ workloadName = $workload.name; imageId = $id; import = $import; definition = $wanted }
@@ -435,7 +453,10 @@ function Get-ConfigurationHash {
         allowedCidrs = @($Workload.allowedCidrs | Sort-Object)
         shareName = if ($Workload.profile -eq 'fileServer') { $Workload.fileServer.shareName } else { '' }
         sqlEdition = if ($Workload.profile -eq 'sqlServer') { $Workload.sqlServer.edition } else { '' }
-        sqlMediaHash = if ($Workload.profile -eq 'sqlServer') { $Workload.sqlServer.installerSha256.ToLowerInvariant() } else { '' }
+        sqlMediaHash = if ($Workload.profile -eq 'sqlServer' -and $Workload.sqlServer['installerSha256']) { $Workload.sqlServer.installerSha256.ToLowerInvariant() } else { '' }
+    }
+    if ($Workload.profile -eq 'sqlServer' -and $Workload.sqlServer['installationMode'] -eq 'marketplace') {
+        $value.sqlInstallationMode = 'marketplace'
     }
     if ($Workload.ContainsKey('dataDisks')) {
         $value.dataDisks = @(Get-WorkloadDisks $Workload | ForEach-Object { [ordered]@{ role = $_.role; sizeGB = $_.sizeGB } })
@@ -536,6 +557,9 @@ function Invoke-WorkloadPreflight {
         $inventory += @(Get-ArmCollection "/subscriptions/$($Answers.subscriptionId)/providers/Microsoft.AzureStackHCI/${type}?api-version=2024-01-01")
     }
     $plan = @(Get-ImagePlan $Answers $inventory)
+    foreach ($workload in @($Answers.workloads | Where-Object { $_.image.source -eq 'marketplace' -and $_.image.publisher -eq 'microsoftsqlserver' })) {
+        Assert-SqlMarketplaceCatalog $Answers $workload.image
+    }
     foreach ($imageGroupId in @($plan | ForEach-Object { ($_.imageId -split '/providers/')[0] } | Sort-Object -Unique)) {
         if ($imageGroupId -notin $groupIds) {
             $group = Get-ArmResource $imageGroupId '2022-09-01'
@@ -634,6 +658,24 @@ function Import-MissingImages {
     }
 }
 
+function Assert-SqlMarketplaceCatalog {
+    param([hashtable]$Answers, [hashtable]$Image)
+    $offer = Invoke-ArmRequest -Path "$($Answers.stamp.clusterResourceId)/providers/Microsoft.EdgeMarketplace/offers/microsoftsqlserver:sql2022-ws2022?api-version=2023-08-01"
+    $sku = @($offer.properties.marketplaceSkus | Where-Object marketplaceSkuId -EQ 'enterprise-gen2')
+    if ($offer.properties.offerContent.offerId -ne 'sql2022-ws2022' -or
+        $offer.properties.offerContent.offerPublisher.publisherId -ne 'microsoftsqlserver' -or
+        $sku.Count -ne 1 -or $sku[0].generation -ne '2' -or $sku[0].operatingSystem.family -ne 'Windows' -or
+        !@($sku[0].marketplaceSkuVersions | Where-Object name -EQ $Image.version).Count) {
+        throw 'The exact pinned SQL Marketplace Windows/V2 image version is not available in this stamp catalog.'
+    }
+    if ($offer.properties.offerContent.termsAndConditions.legalTermsType -ne 'None') {
+        throw 'SQL Marketplace offer requires a separately reviewed terms/purchase flow. No agreement or purchase was accepted.'
+    }
+    if ($offer.properties.offerContent.releaseType -eq 'Preview') {
+        Write-Warning 'The stamp catalog labels this SQL Marketplace offer Preview. Catalog availability and legalTermsType None do not establish license entitlement or production certification.'
+    }
+}
+
 function Get-PreparedImagePath {
     param([hashtable]$Image)
     if ($Image.source -eq 'local') { return $Image.path }
@@ -660,12 +702,18 @@ function Get-PreparedImagePath {
 
 function Get-GuestSettings {
     param([hashtable]$Answers, [hashtable]$Workload)
-    if ($Workload.profile -in @('windowsApp', 'linuxApp')) { return @{} }
+    if ($Workload.profile -eq 'windowsApp') { return @{} }
     $config = @{ profile = $Workload.profile; adminUsername = $Answers.adminUsername; allowedCidrs = $Workload.allowedCidrs }
-    if ($Workload.profile -eq 'webServer') {
-        $scriptText = Get-Content -LiteralPath (Join-Path $script:Root 'guest\configure-nginx.sh') -Raw
-        $cidrs = $Workload.allowedCidrs -join ' '
-        $scriptText = $scriptText.Replace('__ALLOWED_CIDRS__', $cidrs)
+    if (Test-LinuxProfile $Workload) {
+        $scriptText = Get-Content -LiteralPath (Join-Path $script:Root 'guest\validate-linux.sh') -Raw
+        $key = ($Workload.sshPublicKey -split ' ')[0..1] -join ' '
+        $scriptText = $scriptText.Replace('__ADMIN_USERNAME__', $Answers.adminUsername).
+            Replace('__SSH_KEY_BASE64__', [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($key))).
+            Replace('__UBUNTU_VERSION__', $(if ($Workload.image.os -eq 'Ubuntu2404') { '24.04' } else { '22.04' }))
+        if ($Workload.profile -eq 'webServer') {
+            $nginx = Get-Content -LiteralPath (Join-Path $script:Root 'guest\configure-nginx.sh') -Raw
+            $scriptText += "`n" + $nginx.Replace('__ALLOWED_CIDRS__', ($Workload.allowedCidrs -join ' '))
+        }
         return @{ script = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($scriptText -replace "`r`n", "`n"))) }
     }
     $config.dataDiskSizeGB = $Workload.dataDiskSizeGB
@@ -764,9 +812,20 @@ function Start-WorkloadDeployment {
     param(
         [Parameter(Mandatory)][string]$AnswerFile,
         [ValidateSet('Validate', 'Preflight', 'Deploy')][string]$Mode = 'Validate',
-        [ValidateRange(60, 21600)][int]$TimeoutSeconds = 10800
+        [ValidateRange(60, 21600)][int]$TimeoutSeconds = 10800,
+        [switch]$AllowUnverifiedExistingLinuxImage
     )
     $answers = Read-WorkloadAnswers $AnswerFile
+    if (@($answers.workloads | Where-Object { $_.image.ContainsKey('pilotGuestValidation') }).Count) {
+        if (!$AllowUnverifiedExistingLinuxImage) {
+            throw 'pilotGuestValidation requires -AllowUnverifiedExistingLinuxImage for an explicitly authorized disposable pilot. Preparation provenance remains unknown.'
+        }
+        if (@($answers.workloads | Where-Object { $_.image.ContainsKey('pilotGuestValidation') }).Count -gt 2 -or
+            @($answers.workloads | Where-Object { $_.image.ContainsKey('pilotGuestValidation') } | Group-Object profile | Where-Object Count -GT 1).Count) {
+            throw 'Unverified-image pilots permit at most one intended VM per Linux profile.'
+        }
+        Write-Warning 'Pilot image preparation provenance is UNVERIFIED. Only public SSH keys are provisioned; guest acceptance must pass before any service is installed. Successful checks do not certify source-image provenance.'
+    }
     $summary = Get-WorkloadSummary $answers.workloads
     Write-Output ("Plan: {0} VMs, {1} vCPU, {2} MiB RAM, {3} data disks / {4} GiB. OS-disk suggestions: {5} GiB ({6} unspecified); actual OS capacity is inherited from images, not resized." -f
         $summary.vmCount, $summary.processors, $summary.memoryMB, $summary.dataDiskCount, $summary.dataDiskGB, $summary.suggestedOsDiskGB, $summary.unspecifiedOsDiskCount)
@@ -790,7 +849,7 @@ function Start-WorkloadDeployment {
                 dataDiskSizeGB = $workload['dataDiskSizeGB']
                 dataDisks = @(Get-WorkloadDisks $workload)
                 isLinux = Test-LinuxProfile $workload
-                configureGuest = $workload.profile -notin @('windowsApp', 'linuxApp')
+                configureGuest = $workload.profile -ne 'windowsApp'
                 privateIpAddress = if ($workload.ContainsKey('privateIpAddress')) { $workload.privateIpAddress } else { '' }
                 sshPublicKey = if ($workload.ContainsKey('sshPublicKey')) { $workload.sshPublicKey } else { '' }
                 imageId = $image.imageId

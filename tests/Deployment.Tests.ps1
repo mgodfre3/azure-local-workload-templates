@@ -182,6 +182,46 @@ Describe 'Answer contract and pure validation' {
             { Assert-Answers $a } | Should -Throw
         }
 
+        It 'accepts paid SQL only with licensing consent and a same-subscription pinned vault reference' {
+            $path = Join-Path $TestDrive 'licensed.json'
+            $a = New-Answers
+            $a.workloads = @((Get-Content (Join-Path $script:Root 'answers\example.json') -Raw | ConvertFrom-Json -AsHashtable).workloads[1])
+            $w = $a.workloads[0]; $w.count = 1
+            $w.sqlServer.installerUrl = 'https://media.contoso.invalid/sql.iso'
+            $w.sqlServer.installerSha256 = 'a' * 64
+            $source = @{
+                type = 'keyVault'
+                vaultResourceId = "/subscriptions/$($a.subscriptionId)/resourceGroups/secrets/providers/Microsoft.KeyVault/vaults/sql-vault"
+                secretName = 'sql-product-key'; secretVersion = 'b' * 32
+            }
+            foreach ($edition in @('Standard', 'Enterprise')) {
+                $w.sqlServer.edition = $edition
+                $w.sqlServer.productionLicenseConfirmed = $true
+                $w.sqlServer.productKeySource = $source.Clone()
+                Write-Answers $a $path
+                (Read-WorkloadAnswers $path).workloads[0].sqlServer.edition | Should -Be $edition
+                $w.sqlServer.productionLicenseConfirmed = $false
+                Write-Answers $a $path
+                { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+            }
+            $w.sqlServer.productionLicenseConfirmed = $true
+            $w.sqlServer.productKeySource.secretVersion = 'latest'
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+            $w.sqlServer.productKeySource = $source.Clone()
+            $w.sqlServer.productKeySource.vaultResourceId = $source.vaultResourceId.Replace($a.subscriptionId, '11111111-1111-1111-1111-111111111111')
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*subscription*'
+            $w.sqlServer.productKeySource = $source.Clone()
+            $w.sqlServer.productKey = 'plaintext-not-accepted'
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+            $w.sqlServer.Remove('productKey')
+            $w.sqlServer.edition = 'Developer'
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+        }
+
         It 'does not put a Linux password in deployment parameters' {
             $a = New-Answers
             $a.workloads = @(@{ profile = 'webServer' })
@@ -391,6 +431,46 @@ Describe 'Counted profiles and capacity planning' {
 
 Describe 'Prepared Linux image source contracts and imports' {
     InModuleScope WorkloadDeployment {
+        It 'accepts Ubuntu 22.04 and 24.04 for both Linux profiles without widening OS support' {
+            $path = Join-Path $TestDrive 'ubuntu-releases.json'
+            foreach ($os in @('Ubuntu2204', 'Ubuntu2404')) {
+                foreach ($profile in @('webServer', 'linuxApp')) {
+                    $a = New-LinuxAnswers
+                    $a.workloads[0].profile = $profile
+                    $a.workloads[0].image.os = $os
+                    Write-Answers $a $path
+                    (Read-WorkloadAnswers $path).workloads[0].image.os | Should -Be $os
+                    $settings = Get-GuestSettings $a $a.workloads[0]
+                    $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($settings.script))
+                    $version = if ($os -eq 'Ubuntu2404') { '24.04' } else { '22.04' }
+                    $text | Should -Match ([regex]::Escape("VERSION_ID`" = '$version'"))
+                    $text | Should -Not -Match '__ADMIN_USERNAME__|__SSH_KEY_BASE64__|__UBUNTU_VERSION__'
+                }
+            }
+        }
+
+        It 'requires explicit opt-in for existing-image pilots without fabricating preparation confirmation' {
+            $a = New-LinuxAnswers
+            $a.workloads[0].image = @{
+                source = 'existing'; os = 'Ubuntu2404'; pilotGuestValidation = $true
+                resourceId = "/subscriptions/$($a.subscriptionId)/resourceGroups/images/providers/Microsoft.AzureStackHCI/galleryImages/ubuntu-existing"
+            }
+            $path = Join-Path $TestDrive 'unverified.json'
+            Write-Answers $a $path
+            (Read-WorkloadAnswers $path).workloads[0].image.ContainsKey('preparedImageConfirmed') | Should -BeFalse
+            Mock Open-ArmConnection { throw 'Must not authenticate' }
+            { Start-WorkloadDeployment -AnswerFile $path -Mode Preflight } | Should -Throw '*requires -AllowUnverifiedExistingLinuxImage*'
+            { Start-WorkloadDeployment -AnswerFile $path -Mode Validate -AllowUnverifiedExistingLinuxImage -WarningAction SilentlyContinue } | Should -Not -Throw
+            Should -Invoke Open-ArmConnection -Times 0
+            $a.workloads[0].count = 2
+            Write-Answers $a $path
+            { Start-WorkloadDeployment -AnswerFile $path -Mode Validate -AllowUnverifiedExistingLinuxImage } | Should -Throw '*one intended VM*'
+            $a.workloads[0].Remove('count')
+            $a.workloads[0].image.preparedImageConfirmed = $true
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+        }
+
         It 'accepts a stamp CSV source and rejects client paths, traversal, UNC and alternate streams' {
             $a = New-LinuxAnswers
             $path = Join-Path $TestDrive 'prepared.json'
@@ -518,6 +598,98 @@ Describe 'Prepared Linux image source contracts and imports' {
 
 Describe 'Azure image decisions' {
     InModuleScope WorkloadDeployment {
+        It 'reuses or imports only the exact pinned SQL Marketplace tuple without an ISO or PID' {
+            $a = New-Answers
+            $w = $a.workloads[0]
+            $w.profile = 'sqlServer'; $w.memoryMB = 8192; $w.Remove('fileServer')
+            $w.sqlServer = @{ installationMode = 'marketplace'; edition = 'Enterprise'; acceptLicenseTerms = $true; productionLicenseConfirmed = $true }
+            $w.image.publisher = 'microsoftsqlserver'; $w.image.offer = 'sql2022-ws2022'; $w.image.sku = 'enterprise-gen2'; $w.image.version = '16.0.260610'
+            $path = Join-Path $TestDrive 'sql-marketplace.json'
+            Write-Answers $a $path
+            (Read-WorkloadAnswers $path).workloads[0].sqlServer.ContainsKey('installerUrl') | Should -BeFalse
+            $image = New-Image $a
+            $image.properties.identifier = @{ publisher = 'microsoftsqlserver'; offer = 'sql2022-ws2022'; sku = 'enterprise-gen2' }
+            $image.properties.version.name = '16.0.260610'
+            @(Get-ImagePlan $a @($image))[0].imageId | Should -Be $image.id
+            @(Get-ImagePlan $a @())[0].import | Should -BeTrue
+            $image.properties.identifier.sku = 'standard-gen2'
+            @(Get-ImagePlan $a @($image))[0].import | Should -BeTrue
+            $w.image = @{ source = 'existing'; os = 'WindowsServer2022'; resourceId = $image.id }
+            { Get-ImagePlan $a @($image) } | Should -Throw '*exact microsoftsqlserver*'
+            $image.properties.identifier.sku = 'enterprise-gen2'
+            @(Get-ImagePlan $a @($image))[0].import | Should -BeFalse
+            $w.sqlServer.Remove('installationMode')
+            { Get-ImagePlan $a @($image) } | Should -Throw '*preinstalled SQL image*'
+        }
+
+        It 'imports the exact SQL identifier and pinned version with a create-only request' {
+            $a = New-Answers
+            $w = $a.workloads[0]
+            $w.profile = 'sqlServer'; $w.memoryMB = 8192; $w.Remove('fileServer')
+            $w.sqlServer = @{ installationMode = 'marketplace'; edition = 'Enterprise'; acceptLicenseTerms = $true; productionLicenseConfirmed = $true }
+            $w.image.publisher = 'microsoftsqlserver'; $w.image.offer = 'sql2022-ws2022'; $w.image.sku = 'enterprise-gen2'; $w.image.version = '16.0.260610'
+            $plan = @(Get-ImagePlan $a @())
+            $script:sqlReadyImage = New-Image $a
+            $script:sqlReadyImage.id = $plan[0].imageId
+            $script:sqlReadyImage.properties.identifier = @{ publisher = 'microsoftsqlserver'; offer = 'sql2022-ws2022'; sku = 'enterprise-gen2' }
+            $script:sqlReadyImage.properties.version.name = '16.0.260610'
+            Mock Get-ArmResource { $null }
+            Mock Wait-ArmResource { $script:sqlReadyImage }
+            Mock Invoke-ArmRequest { $script:sqlImportBody = $Body }
+            Import-MissingImages $a $plan 600
+            Should -Invoke Invoke-ArmRequest -Times 1 -ParameterFilter { $Method -eq 'PUT' -and $CreateOnly -and $Path -like '*marketplaceGalleryImages*' }
+            $script:sqlImportBody.properties.identifier.publisher | Should -Be microsoftsqlserver
+            $script:sqlImportBody.properties.identifier.offer | Should -Be sql2022-ws2022
+            $script:sqlImportBody.properties.identifier.sku | Should -Be enterprise-gen2
+            $script:sqlImportBody.properties.version.name | Should -Be '16.0.260610'
+            $script:sqlImportBody.properties.osType | Should -Be Windows
+            $script:sqlImportBody.properties.hyperVGeneration | Should -Be V2
+        }
+
+        It 'rejects SQL Marketplace media/key conflicts and use as an unlicensed OS image' {
+            $a = New-Answers
+            $w = $a.workloads[0]
+            $w.profile = 'sqlServer'; $w.memoryMB = 8192; $w.Remove('fileServer')
+            $w.sqlServer = @{ installationMode = 'marketplace'; edition = 'Enterprise'; acceptLicenseTerms = $true; productionLicenseConfirmed = $true }
+            $w.image.publisher = 'microsoftsqlserver'; $w.image.offer = 'sql2022-ws2022'; $w.image.sku = 'enterprise-gen2'; $w.image.version = '16.0.260610'
+            $path = Join-Path $TestDrive 'sql-mode-conflicts.json'
+            foreach ($field in @('installerUrl', 'installerSha256', 'productKeySource')) {
+                $w.sqlServer[$field] = 'not-allowed'
+                Write-Answers $a $path
+                { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+                $w.sqlServer.Remove($field)
+            }
+            $w.sqlServer.productionLicenseConfirmed = $false
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+            $w.sqlServer.productionLicenseConfirmed = $true
+            $w.image.sku = '2022-datacenter-azure-edition'
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+        }
+
+        It 'checks the stamp-specific catalog version and refuses a separate terms/purchase requirement' {
+            $script:sqlOffer = @{
+                properties = @{
+                    offerContent = @{
+                        offerId = 'sql2022-ws2022'; offerPublisher = @{ publisherId = 'microsoftsqlserver' }
+                        releaseType = 'Preview'; termsAndConditions = @{ legalTermsType = 'None' }
+                    }
+                    marketplaceSkus = @(@{
+                        marketplaceSkuId = 'enterprise-gen2'; generation = '2'; operatingSystem = @{ family = 'Windows' }
+                        marketplaceSkuVersions = @(@{ name = '16.0.260610' })
+                    })
+                }
+            }
+            Mock Invoke-ArmRequest { $script:sqlOffer }
+            $a = New-Answers
+            { Assert-SqlMarketplaceCatalog $a @{ version = '16.0.260610' } -WarningAction SilentlyContinue } | Should -Not -Throw
+            Should -Invoke Invoke-ArmRequest -Times 1 -ParameterFilter { $Path -like "$($a.stamp.clusterResourceId)/providers/Microsoft.EdgeMarketplace/offers/*" }
+            { Assert-SqlMarketplaceCatalog $a @{ version = '16.0.111111' } } | Should -Throw '*not available*'
+            $script:sqlOffer.properties.offerContent.termsAndConditions.legalTermsType = 'ThirdParty'
+            { Assert-SqlMarketplaceCatalog $a @{ version = '16.0.260610' } } | Should -Throw '*No agreement or purchase was accepted*'
+        }
+
         It 'reuses a matching pinned image even when it has a different name' {
             $a = New-Answers
             $image = New-Image $a
@@ -671,12 +843,15 @@ Describe 'Static addressing, RBAC and bounded polling' {
 
 Describe 'Guest delivery and deployment boundaries' {
     InModuleScope WorkloadDeployment {
-        It 'does not run service scripts or read Windows artifacts for base application profiles' {
+        It 'runs only image acceptance for base Linux and no guest script for base Windows' {
             $a = New-Answers
             Mock Get-WindowsGuestArtifact { throw 'Must not download a script' }
-            foreach ($profile in @('windowsApp', 'linuxApp')) {
-                (Get-GuestSettings $a @{ profile = $profile }).Count | Should -Be 0
-            }
+            (Get-GuestSettings $a @{ profile = 'windowsApp' }).Count | Should -Be 0
+            $linux = New-LinuxAnswers
+            $settings = Get-GuestSettings $linux $linux.workloads[0]
+            $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($settings.script))
+            $text | Should -Match 'cloud-init status --wait'
+            $text | Should -Not -Match 'apt-get|nginx|mkfs'
             Should -Invoke Get-WindowsGuestArtifact -Times 0
             $a.workloads = @(@{ profile = 'linuxApp' })
             (Get-PasswordParameter $a).value | Should -Be ''
@@ -704,8 +879,8 @@ Describe 'Guest delivery and deployment boundaries' {
             $items.name | Should -Be @('linuxapp-01', 'linuxapp-02')
             foreach ($item in $items) {
                 $item.isLinux | Should -BeTrue
-                $item.configureGuest | Should -BeFalse
-                $item.guestSettings.Count | Should -Be 0
+                $item.configureGuest | Should -BeTrue
+                $item.guestSettings.ContainsKey('script') | Should -BeTrue
                 $item.dataDisks.role | Should -Be @('appdata', 'logs')
                 $item.dataDisks.sizeGB | Should -Be @(64, 32)
                 $item.processors | Should -Be 2
@@ -716,8 +891,8 @@ Describe 'Guest delivery and deployment boundaries' {
         }
 
         It 'embeds restricted Linux content without an external script download' {
-            $a = New-Answers
-            $w = @{ profile = 'webServer'; allowedCidrs = @('10.40.0.0/24') }
+            $a = New-LinuxAnswers
+            $w = $a.workloads[0]; $w.profile = 'webServer'; $w.allowedCidrs = @('10.40.0.0/24')
             $settings = Get-GuestSettings $a $w
             $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($settings.script))
             $text | Should -Match "allowed_cidrs='10.40.0.0/24'"

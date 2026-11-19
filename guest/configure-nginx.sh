@@ -2,8 +2,8 @@
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 . /etc/os-release
-[ "$ID" = ubuntu ] && [ "$VERSION_ID" = 22.04 ] || {
-    echo "Only a prepared Ubuntu 22.04 LTS image is supported." >&2
+[ "$ID" = ubuntu ] && { [ "$VERSION_ID" = 22.04 ] || [ "$VERSION_ID" = 24.04 ]; } || {
+    echo "Only a prepared Ubuntu 22.04 or 24.04 LTS image is supported." >&2
     exit 1
 }
 allowed_cidrs='__ALLOWED_CIDRS__'

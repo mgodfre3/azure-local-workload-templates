@@ -25,4 +25,4 @@ jobs:
       - name: Check shell syntax
         if: runner.os == 'Linux'
         shell: bash
-        run: sh -n guest/configure-nginx.sh
+        run: sh -n guest/configure-nginx.sh && sh -n guest/validate-linux.sh

@@ -32,6 +32,7 @@ Describe 'Compiled ARM deployment contract' {
         $os | Should -Match 'provisionVMAgent'
         $os | Should -Match 'provisionVMConfigAgent'
         $os | Should -Match 'disablePasswordAuthentication'
+        $os | Should -Not -Match 'customData|cloud-config|write_files'
     }
 
     It 'uses the supplied storage container for the data disk and VM configuration' {

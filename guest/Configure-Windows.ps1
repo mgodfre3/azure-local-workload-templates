@@ -4,7 +4,7 @@ param([Parameter(Mandatory = $true)][string]$ConfigurationBase64)
 function Assert-Keys($Object, $Keys) {
     if ($null -eq $Object -or $Object -isnot [pscustomobject]) { throw 'Expected a JSON object.' }
     foreach ($p in $Object.PSObject.Properties.Name) {
-        if ($p -cnotin $Keys) { throw 'Unsupported configuration property; secrets and product keys are not accepted.' }
+        if ($p -cnotin $Keys) { throw 'Unsupported configuration property; plaintext secrets and product keys are not accepted.' }
     }
 }
 
@@ -50,23 +50,49 @@ function Read-WorkloadConfiguration([string]$Payload) {
     }
     if ($null -ne $c.fileServer) { Assert-Keys $c.fileServer @('shareName') }
     if ($null -ne $c.sqlServer) {
-        Assert-Keys $c.sqlServer @('installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed')
+        Assert-Keys $c.sqlServer @('installationMode', 'installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed', 'productKeySource')
     }
     if ($c.profile -eq 'fileServer') {
         Assert-Keys $c.fileServer @('shareName')
         if ($c.fileServer.shareName -cnotmatch '^[A-Za-z][A-Za-z0-9_-]{0,63}$' -or
             $c.fileServer.shareName -in @('ADMIN', 'IPC', 'print')) { throw 'Invalid SMB share name.' }
     } elseif ($c.profile -eq 'sqlServer') {
-        Assert-Keys $c.sqlServer @('installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed')
+        Assert-Keys $c.sqlServer @('installationMode', 'installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed', 'productKeySource')
         $s = $c.sqlServer
-        if ($s.edition -cnotin @('Developer', 'Evaluation')) { throw 'Only SQL Developer or Evaluation is supported; paid editions are not automated.' }
-        if ($s.acceptLicenseTerms -isnot [bool] -or !$s.acceptLicenseTerms -or
+        $marketplace = $s.installationMode -ceq 'marketplace'
+        if ($s.PSObject.Properties.Name -contains 'installationMode' -and $s.installationMode -cnotin @('iso', 'marketplace')) {
+            throw 'Unsupported SQL installationMode.'
+        }
+        if ($s.edition -cnotin @('Developer', 'Evaluation', 'Standard', 'Enterprise')) { throw 'Only SQL Developer, Evaluation, Standard or Enterprise is supported.' }
+        if ($s.acceptLicenseTerms -isnot [bool] -or !$s.acceptLicenseTerms) { throw 'Explicit SQL license consent is required.' }
+        if ($s.edition -in @('Standard', 'Enterprise')) {
+            if ($s.productionLicenseConfirmed -isnot [bool] -or !$s.productionLicenseConfirmed) {
+                throw 'Paid SQL editions require explicit productionLicenseConfirmed and a pinned Key Vault productKeySource.'
+            }
+            if (!$marketplace) {
+                Assert-Keys $s.productKeySource @('type', 'vaultResourceId', 'secretName', 'secretVersion')
+                $source = $s.productKeySource
+                if ($source.type -cne 'keyVault' -or
+                    $source.vaultResourceId -notmatch '^/subscriptions/[0-9a-f-]{36}/resourceGroups/[^/]+/providers/Microsoft\.KeyVault/vaults/[a-z][a-z0-9-]{1,22}[a-z0-9]$' -or
+                    $source.secretName -cnotmatch '^[a-zA-Z0-9-]{1,127}$' -or
+                    $source.secretVersion -notmatch '^[0-9a-f]{32}$') {
+                    throw 'SQL productKeySource must reference an Azure public-cloud Key Vault secret with a pinned version.'
+                }
+            }
+        } elseif ($s.PSObject.Properties.Name -contains 'productKeySource' -or
             ($s.PSObject.Properties.Name -contains 'productionLicenseConfirmed' -and
                 ($s.productionLicenseConfirmed -isnot [bool] -or $s.productionLicenseConfirmed))) {
-            throw 'Explicit license consent and nonproduction use are required.'
+            throw 'Developer and Evaluation require nonproduction use and cannot specify a product key source.'
         }
-        if ($s.installerSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'A SHA256 media checksum is required.' }
-        $null = Assert-MediaUrl $s.installerUrl
+        if ($marketplace) {
+            if ($s.edition -cne 'Enterprise' -or
+                @($s.PSObject.Properties.Name | Where-Object { $_ -in @('installerUrl', 'installerSha256', 'productKeySource') }).Count) {
+                throw 'Marketplace mode requires Enterprise and cannot accept ISO media or a product key source; preinstalled SQL is never reinstalled.'
+            }
+        } else {
+            if ($s.installerSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'A SHA256 media checksum is required.' }
+            $null = Assert-MediaUrl $s.installerUrl
+        }
     }
     if (($c.profile -ne 'fileServer' -and $null -ne $c.fileServer) -or
         ($c.profile -ne 'sqlServer' -and $null -ne $c.sqlServer)) { throw 'Profile settings do not match the requested service.' }
@@ -303,7 +329,13 @@ IS_SRVROLEMEMBER('sysadmin',N'$SystemAccount') AS SystemRole,
  OR (database_id=2 AND physical_name NOT LIKE N'E:\Sql\Temp\%')) AS BadPaths
 "@
     $row = (Get-SqlResult $query $Server).Rows[0]
-    $edition = if ($Sql.edition -eq 'Developer') { 'Developer Edition*' } else { 'Enterprise Evaluation Edition*' }
+    $edition = switch ($Sql.edition) {
+        'Developer' { 'Developer Edition*' }
+        'Evaluation' { 'Enterprise Evaluation Edition*' }
+        'Standard' { 'Standard Edition*' }
+        'Enterprise' { 'Enterprise Edition*' }
+        default { throw 'Unsupported requested SQL edition.' }
+    }
     if ($row.Probe -ne 1 -or $row.Major -ne 16 -or $row.Edition -notlike $edition -or $row.WindowsOnly -ne 1 -or
         $row.DataPath.TrimEnd('\') -ne 'E:\Sql\Data' -or $row.LogPath.TrimEnd('\') -ne 'E:\Sql\Log' -or
         $row.AdminRole -ne 1 -or $row.SystemRole -ne 1 -or $row.BadPaths -ne 0) {
@@ -349,6 +381,124 @@ function Save-SqlIso($Sql, [string]$Path) {
     if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Sql.installerSha256) { throw 'SQL ISO SHA256 mismatch; setup was not executed.' }
 }
 
+function Get-SqlProductKey($Source) {
+    # The key is fetched only inside the guest, never by ARM or the launcher.
+    Add-Type -AssemblyName System.Net.Http
+    $handler = New-Object Net.Http.HttpClientHandler
+    $handler.AllowAutoRedirect = $false
+    $handler.UseProxy = $false
+    $client = New-Object Net.Http.HttpClient($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(30)
+    $vaultClient = $null
+    $vaultHandler = $null
+    $endpoint = 'http://localhost:40342/metadata/identity/oauth2/token?api-version=2020-06-01&resource=https%3A%2F%2Fvault.azure.net'
+    try {
+        $null = $client.DefaultRequestHeaders.TryAddWithoutValidation('Metadata', 'true')
+        $challenge = $client.GetAsync($endpoint).GetAwaiter().GetResult()
+        try {
+            if ([int]$challenge.StatusCode -ne 401) { throw 'Arc identity challenge was not returned.' }
+            $header = $challenge.Headers.WwwAuthenticate.ToString()
+            if ($header -notmatch '^Basic realm="?([^"]+)"?$') { throw 'Invalid Arc identity challenge.' }
+            $path = [IO.Path]::GetFullPath($Matches[1])
+            $tokenDirectory = Join-Path $env:ProgramData 'AzureConnectedMachineAgent\Tokens'
+            if ((Split-Path $path -Parent) -ine $tokenDirectory -or
+                (Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
+                (Get-Item -LiteralPath $tokenDirectory -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'Unexpected Arc identity challenge path.'
+            }
+            $challengeSecret = [IO.File]::ReadAllText($path)
+        } finally { $challenge.Dispose() }
+        $null = $client.DefaultRequestHeaders.TryAddWithoutValidation('Authorization', "Basic $challengeSecret")
+        $response = $client.GetAsync($endpoint).GetAwaiter().GetResult()
+        try {
+            if (!$response.IsSuccessStatusCode) { throw 'Arc identity token request failed.' }
+            $token = ($response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json).access_token
+            if (!$token) { throw 'Arc identity token is missing.' }
+        } finally { $response.Dispose() }
+        $vault = ($Source.vaultResourceId -split '/')[-1]
+        $uri = "https://$vault.vault.azure.net/secrets/$($Source.secretName)/$($Source.secretVersion)?api-version=7.4"
+        $vaultHandler = New-Object Net.Http.HttpClientHandler
+        $vaultHandler.AllowAutoRedirect = $false
+        $vaultClient = New-Object Net.Http.HttpClient($vaultHandler)
+        $vaultClient.Timeout = [TimeSpan]::FromSeconds(30)
+        $vaultClient.DefaultRequestHeaders.Authorization = New-Object Net.Http.Headers.AuthenticationHeaderValue('Bearer', $token)
+        $secretResponse = $vaultClient.GetAsync($uri).GetAwaiter().GetResult()
+        try {
+            if (!$secretResponse.IsSuccessStatusCode) { throw 'Key Vault secret request failed.' }
+            $key = ($secretResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json).value
+            Assert-SqlProductKey $key
+            return $key
+        } finally { $secretResponse.Dispose() }
+    } catch {
+        throw 'SQL product key retrieval failed. Verify the pinned secret, guest Arc identity secret-get permission and vault connectivity; secret values and responses are suppressed.'
+    } finally {
+        $client.Dispose()
+        $handler.Dispose()
+        if ($null -ne $vaultClient) { $vaultClient.Dispose() }
+        if ($null -ne $vaultHandler) { $vaultHandler.Dispose() }
+        $key = $null; $token = $null; $challengeSecret = $null
+    }
+}
+
+function Assert-MarketplaceSqlInstance($Config) {
+    $service = Get-Service MSSQLSERVER -ErrorAction Stop
+    if ($service.Status -ne 'Running') { throw 'Preinstalled SQL default-instance service is not Running; no reinstall or automatic repair was attempted.' }
+    $row = (Get-SqlResult @"
+SELECT 1 AS Probe, CONVERT(int,SERVERPROPERTY('ProductMajorVersion')) AS Major,
+CONVERT(nvarchar(128),SERVERPROPERTY('Edition')) AS Edition,
+CONVERT(int,SERVERPROPERTY('IsIntegratedSecurityOnly')) AS WindowsOnly,
+(SELECT COUNT(*) FROM sys.databases WHERE state_desc <> N'ONLINE') AS OfflineDatabases
+"@).Rows[0]
+    if ($row.Probe -ne 1 -or $row.Major -ne 16 -or $row.Edition -notlike 'Enterprise Edition*' -or
+        $row.WindowsOnly -ne 1 -or $row.OfflineDatabases -ne 0) {
+        throw 'Preinstalled SQL 2022 Enterprise, Windows authentication or online-database acceptance failed; no reinstall, key injection or database relocation was attempted.'
+    }
+    Assert-ScopedFirewall 1433 $Config.allowedCidrs
+    Write-Output 'Preinstalled SQL 2022 Enterprise local integrated query and database acceptance passed. Image database paths and extra RAW disks were preserved; no SQL listener or firewall rule was changed. Verify administrator/client access and licensing separately.'
+}
+
+function Assert-SqlProductKey([string]$Key) {
+    if ($Key.Length -ne 29 -or $Key -cnotmatch '^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$' -or
+        $Key -in @('22222-00000-00000-00000-00000', '00000-00000-00000-00000-00000', '11111-00000-00000-00000-00000')) {
+        throw 'The SQL product key secret must contain a paid-edition PID in five groups of five uppercase letters/digits; its value is not logged.'
+    }
+}
+
+function Invoke-SqlSetup([string]$Setup, [string]$Arguments, $Sql, [string]$Cache) {
+    $directory = Join-Path $Cache ([guid]::NewGuid().ToString())
+    Set-PrivateDirectory $directory @()
+    $config = Join-Path $directory 'setup.ini'
+    $stdout = Join-Path $directory 'stdout.log'
+    $stderr = Join-Path $directory 'stderr.log'
+    $key = $null
+    try {
+        if ($Sql.edition -eq 'Developer') { $key = '22222-00000-00000-00000-00000' }
+        elseif ($Sql.edition -in @('Standard', 'Enterprise')) {
+            $key = Get-SqlProductKey $Sql.productKeySource
+            Assert-SqlProductKey $key
+        }
+        else { throw 'Evaluation setup must not use a PID configuration.' }
+        # A new file inherits the private directory's SYSTEM/Administrators-only ACL.
+        $stream = [IO.File]::Open($config, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $writer = New-Object IO.StreamWriter($stream, [Text.Encoding]::Unicode)
+            try { $writer.Write("[OPTIONS]`r`nPID=`"$key`"`r`n") }
+            finally { $writer.Dispose() }
+        } finally { $stream.Dispose() }
+        $process = Start-Process -FilePath $Setup -ArgumentList "$Arguments /ConfigurationFile=`"$config`"" -Wait -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        return $process.ExitCode
+    } catch {
+        throw 'SQL setup could not complete using its private PID configuration. Secret-bearing output is suppressed; check guest prerequisites and protected SQL Setup logs.'
+    } finally {
+        $key = $null
+        foreach ($file in @($config, $stdout, $stderr)) {
+            if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force -ErrorAction Stop }
+        }
+        Remove-Item -LiteralPath $directory -Force -ErrorAction Stop
+    }
+}
+
 function Install-SqlInstance($Sql, [string]$Account, [string]$SystemAccount) {
     # Public setup flags and predefined free-edition PIDs:
     # https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-from-the-command-prompt?view=sql-server-ver16
@@ -370,8 +520,7 @@ function Install-SqlInstance($Sql, [string]$Account, [string]$SystemAccount) {
             $signature = Get-AuthenticodeSignature $setup
             if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation,') { throw 'SQL setup signature verification failed.' }
             $arguments = '/Q /ACTION=Install /FEATURES=SQLENGINE /INSTANCENAME=MSSQLSERVER /IACCEPTSQLSERVERLICENSETERMS /SUPPRESSPRIVACYSTATEMENTNOTICE /UPDATEENABLED=False /TCPENABLED=0 /NPENABLED=0 /SQLSVCACCOUNT="NT Service\MSSQLSERVER" /SQLSVCSTARTUPTYPE=Automatic /AGTSVCACCOUNT="NT Service\SQLSERVERAGENT" /AGTSVCSTARTUPTYPE=Disabled /BROWSERSVCSTARTUPTYPE=Disabled /INSTALLSQLDATADIR="E:\Sql" /SQLUSERDBDIR="E:\Sql\Data" /SQLUSERDBLOGDIR="E:\Sql\Log" /SQLTEMPDBDIR="E:\Sql\Temp" /SQLTEMPDBLOGDIR="E:\Sql\Temp" /SQLBACKUPDIR="E:\Sql\Backup"'
-            if ($Sql.edition -eq 'Developer') { $arguments += ' /PID=22222-00000-00000-00000-00000' }
-            else {
+            if ($Sql.edition -eq 'Evaluation') {
                 # Omitted PID means Evaluation only on evaluation media, not media with a predefined paid/developer key.
                 $defaults = Join-Path $root 'x64\DefaultSetup.ini'
                 if ((Test-Path $defaults) -and ((Get-Content $defaults -Raw) -match '(?im)^\s*PID\s*=\s*"?([A-Za-z0-9-]+)' ) -and
@@ -380,9 +529,12 @@ function Install-SqlInstance($Sql, [string]$Account, [string]$SystemAccount) {
                 }
             }
             $arguments += " /SQLSYSADMINACCOUNTS=`"$Account`" `"$SystemAccount`""
-            $process = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru
-            if ($process.ExitCode -in @(3010, 1641)) { throw 'SQL setup requires a manual restart; rerun after restart.' }
-            if ($process.ExitCode -ne 0) { throw "SQL setup failed with exit code $($process.ExitCode). Review local SQL setup logs." }
+            if ($Sql.edition -eq 'Evaluation') {
+                $process = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru
+                $exitCode = $process.ExitCode
+            } else { $exitCode = Invoke-SqlSetup $setup $arguments $Sql $cache }
+            if ($exitCode -in @(3010, 1641)) { throw 'SQL setup requires a manual restart; rerun after restart.' }
+            if ($exitCode -ne 0) { throw "SQL setup failed with exit code $exitCode. Review protected local SQL setup logs." }
         } finally { Dismount-DiskImage -ImagePath $iso | Out-Null }
     } finally { if (Test-Path $iso) { Remove-Item -LiteralPath $iso -Force } }
 }
@@ -454,6 +606,11 @@ function Invoke-WorkloadConfiguration([string]$Payload) {
     if (!$admin.Enabled -or $admin.SID.Value -notin $members.SID.Value) { throw 'adminUsername must be an enabled local Administrator.' }
     $port = switch ($c.profile) { 'fileServer' { 445 } 'sqlServer' { 1433 } 'iisServer' { 80 } }
     Assert-ScopedFirewall $port $c.allowedCidrs
+    if ($c.profile -eq 'sqlServer' -and $c.sqlServer.installationMode -eq 'marketplace') {
+        Assert-MarketplaceSqlInstance $c
+        Assert-NoRestart
+        return
+    }
     Initialize-WorkloadData $c.dataDiskSizeGB
     switch ($c.profile) {
         'fileServer' { Set-FileServer $c $admin }

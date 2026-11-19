@@ -60,7 +60,8 @@
         "installerUrl": "https://downloads.example.org/sql-server-2022.iso",
         "installerSha256": "0000000000000000000000000000000000000000000000000000000000000000",
         "edition": "Developer",
-        "acceptLicenseTerms": true
+        "acceptLicenseTerms": true,
+        "productionLicenseConfirmed": false
       }
     },
     {
