@@ -1,4 +1,5 @@
 param location string
+param collectionLocation string = location
 param machineName string
 param workspaceId string
 param isLinux bool
@@ -24,7 +25,7 @@ resource agent 'Microsoft.HybridCompute/machines/extensions@2024-07-10' = {
 
 resource collection 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
   name: '${machineName}-collection'
-  location: location
+  location: collectionLocation
   kind: isLinux ? 'Linux' : 'Windows'
   tags: tags
   properties: {

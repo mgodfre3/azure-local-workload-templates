@@ -494,7 +494,7 @@ function Invoke-WorkloadPreflight {
     $rgId = "/subscriptions/$($Answers.subscriptionId)/resourceGroups/$($Answers.resourceGroup)"
     $groupIds = @($rgId, ($Answers.stamp.clusterResourceId -split '/providers/')[0],
         ($Answers.stamp.customLocationId -split '/providers/')[0], ($Answers.logicalNetworkId -split '/providers/')[0],
-        ($Answers.storageContainerId -split '/providers/')[0], ($Answers.logAnalyticsWorkspaceId -split '/providers/')[0])
+        ($Answers.storageContainerId -split '/providers/')[0])
     $groupIds += @($Answers.workloads | Where-Object { $_.image.source -eq 'existing' } | ForEach-Object { ($_.image.resourceId -split '/providers/')[0] })
     foreach ($groupId in @($groupIds | Sort-Object -Unique)) {
         $group = Get-ArmResource $groupId '2022-09-01'
@@ -521,7 +521,7 @@ function Invoke-WorkloadPreflight {
     $storage = Get-ArmResource $Answers.storageContainerId
     Assert-ReadyResource $storage $Answers.stamp.customLocationId $Answers.location
     $workspace = Get-ArmResource $Answers.logAnalyticsWorkspaceId '2022-10-01'
-    Assert-ReadyResource $workspace '' $Answers.location
+    Assert-ReadyResource $workspace
     if ($workspace.properties['publicNetworkAccessForIngestion'] -eq 'Disabled' -or
         @($workspace.properties['privateLinkScopedResources']).Where({ $null -ne $_ }).Count) {
         throw 'Private Link/restricted-ingestion monitoring is unsupported in v1; use a separately designed DCE/AMPLS configuration.'

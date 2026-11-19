@@ -631,6 +631,30 @@ Describe 'Static addressing, RBAC and bounded polling' {
             { Assert-DeploymentPermissions '/scope' @('Microsoft.Insights/dataCollectionRules/write') } | Should -Not -Throw
         }
 
+        It 'permits an existing cross-region workspace without applying stamp-region checks to its group' {
+            $script:preflightAnswers = New-Answers
+            $script:preflightAnswers.workloads = @()
+            $script:preflightAnswers.logAnalyticsWorkspaceId = "/subscriptions/$($script:preflightAnswers.subscriptionId)/resourceGroups/central-monitor/providers/Microsoft.OperationalInsights/workspaces/logs"
+            Mock Invoke-ArmRequest { @{ registrationState = 'Registered' } }
+            Mock Assert-DeploymentPermissions {}
+            Mock Assert-NetworkConfiguration {}
+            Mock Get-ArmCollection { @() }
+            Mock Get-ArmResource {
+                param($Id)
+                if ($Id -eq ($script:preflightAnswers.logAnalyticsWorkspaceId -split '/providers/')[0]) {
+                    throw 'Workspace group location is independent of the stamp.'
+                }
+                $region = if ($Id -eq $script:preflightAnswers.logAnalyticsWorkspaceId) { 'southcentralus' } else { $script:preflightAnswers.location }
+                @{
+                    name = 'fixture'; location = $region
+                    extendedLocation = @{ name = $script:preflightAnswers.stamp.customLocationId }
+                    properties = @{ provisioningState = 'Succeeded'; connectivityStatus = 'Connected' }
+                }
+            }
+            { Invoke-WorkloadPreflight $script:preflightAnswers } | Should -Not -Throw
+            Should -Invoke Get-ArmResource -Times 1 -ParameterFilter { $Id -eq $script:preflightAnswers.logAnalyticsWorkspaceId }
+        }
+
         It 'stops on terminal failure and does not report success on timeout' {
             Mock Get-ArmResource { @{ name = 'test'; properties = @{ provisioningState = 'Failed' } } }
             { Wait-ArmResource '/id' 'api' 0 0 } | Should -Throw '*Failed*'

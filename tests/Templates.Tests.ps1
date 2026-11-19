@@ -67,4 +67,16 @@ Describe 'Compiled ARM deployment contract' {
         $rule = @($monitoring.resources | Where-Object type -EQ 'Microsoft.Insights/dataCollectionRules')[0]
         $rule.properties.destinations.logAnalytics[0].workspaceResourceId | Should -Match "parameters\('workspaceId'\)"
     }
+
+    It 'places DCRs with the workspace while keeping AMA in the machine region' {
+        $rule = @($monitoring.resources | Where-Object type -EQ 'Microsoft.Insights/dataCollectionRules')[0]
+        $rule.location | Should -Be "[parameters('collectionLocation')]"
+        $monitoringModule = @($workload.resources | Where-Object type -EQ 'Microsoft.Resources/deployments')[0]
+        $region = $monitoringModule.properties.parameters.collectionLocation.value
+        $region | Should -Match 'reference\('
+        $region | Should -Match "parameters\('workspaceId'\)"
+        $region | Should -Match '\.location\]'
+        $extension = @($monitoring.resources | Where-Object type -EQ 'Microsoft.HybridCompute/machines/extensions')[0]
+        $extension.location | Should -Be "[parameters('location')]"
+    }
 }

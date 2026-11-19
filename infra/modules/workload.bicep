@@ -17,6 +17,11 @@ var ownership = {
   configurationHash: workload.configurationHash
 }
 
+resource workspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' existing = {
+  scope: resourceGroup(split(workspaceId, '/')[2], split(workspaceId, '/')[4])
+  name: last(split(workspaceId, '/'))
+}
+
 resource machine 'Microsoft.HybridCompute/machines@2024-07-10' = {
   name: workload.name
   location: location
@@ -144,6 +149,7 @@ module monitoring 'monitoring.bicep' = {
   name: '${workload.name}-monitoring'
   params: {
     location: location
+    collectionLocation: workspace.location
     machineName: machine.name
     workspaceId: workspaceId
     isLinux: isLinux
