@@ -8,7 +8,16 @@ function Assert-Keys($Object, $Keys) {
     }
 }
 
-function Get-CidrRange([string]$Cidr) {
+function Get-CidrRange([string]$Cidr, [switch]$AllowSubnetMask) {
+    if ($AllowSubnetMask -and $Cidr -match '^(\d{1,3}\.){3}\d{1,3}/(\d{1,3}\.){3}\d{1,3}$') {
+        $ip, $mask = $Cidr.Split('/')
+        $bits = -join ($mask.Split('.') | ForEach-Object {
+            if ([int]$_ -gt 255 -or "$([int]$_)" -cne $_) { throw 'Invalid IPv4 subnet mask.' }
+            [Convert]::ToString([int]$_, 2).PadLeft(8, '0')
+        })
+        if ($bits -notmatch '^1+0*$') { throw 'Expected a contiguous non-universal IPv4 subnet mask.' }
+        $Cidr = "$ip/$($bits.TrimEnd('0').Length)"
+    }
     if ($Cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/([1-9]|[12]\d|3[0-2])$') { throw 'Expected a non-universal IPv4 CIDR.' }
     $ip, $prefix = $Cidr.Split('/')
     [uint64]$n = 0
@@ -199,7 +208,7 @@ function Assert-ScopedFirewall([int]$Port, [string[]]$Cidrs) {
             $contained = $false
             try {
                 if ($address -notmatch '/') { $address += '/32' }
-                $range = Get-CidrRange $address
+                $range = Get-CidrRange $address -AllowSubnetMask
                 foreach ($cidr in $Cidrs) {
                     $allowed = Get-CidrRange $cidr
                     if ($range[0] -ge $allowed[0] -and $range[1] -le $allowed[1]) { $contained = $true }

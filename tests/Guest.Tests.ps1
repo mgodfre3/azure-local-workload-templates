@@ -79,6 +79,35 @@ Describe 'IIS site safety' {
     }
 }
 
+Describe 'Windows firewall address normalization' {
+    BeforeAll {
+        function Get-NetFirewallProfile { param($PolicyStore) }
+        function Get-NetFirewallRule { param($PolicyStore, $Enabled, $Direction, $Action) }
+        function Get-NetFirewallPortFilter { param([Parameter(ValueFromPipeline)]$InputObject) }
+        function Get-NetFirewallAddressFilter { param([Parameter(ValueFromPipeline)]$InputObject) }
+    }
+    BeforeEach {
+        Mock Get-NetFirewallProfile { [pscustomobject]@{ Enabled = $true; DefaultInboundAction = 'Block' } }
+        Mock Get-NetFirewallRule { [pscustomobject]@{ Name = 'inherited-rule' } }
+        Mock Get-NetFirewallPortFilter { [pscustomobject]@{ Protocol = 'TCP'; LocalPort = 'Any' } }
+    }
+    It 'accepts Windows dotted-netmask normalization only for a contained firewall scope' {
+        Mock Get-NetFirewallAddressFilter { [pscustomobject]@{ RemoteAddress = @('192.0.2.0/255.255.255.0') } }
+        { Assert-ScopedFirewall 445 @('192.0.2.0/24') } | Should -Not -Throw
+        { Get-CidrRange '192.0.2.0/255.255.255.0' } | Should -Throw '*CIDR*'
+        (Get-CidrRange '192.0.2.19/255.255.255.255' -AllowSubnetMask) -join ',' |
+            Should -Be ((Get-CidrRange '192.0.2.19/32') -join ',')
+    }
+    It 'still rejects universal, noncontiguous, noncanonical and outside firewall scopes' {
+        foreach ($address in @('Any', '192.0.2.0/0.0.0.0', '192.0.2.0/255.0.255.0',
+            '192.0.2.0/255.255.256.0', '192.0.2.1/255.255.255.0', '192.0.0.0/255.255.0.0',
+            '198.51.100.0/255.255.255.0')) {
+            Mock Get-NetFirewallAddressFilter { [pscustomobject]@{ RemoteAddress = @($address) } }
+            { Assert-ScopedFirewall 445 @('192.0.2.0/24') } | Should -Throw '*outside allowedCidrs*'
+        }
+    }
+}
+
 Describe 'Safe workload disk selection (pure inventory)' {
     BeforeEach {
         $disk = [pscustomobject]@{ Number = 1; Size = 128GB; IsBoot = $false; IsSystem = $false; PartitionStyle = 'RAW' }
