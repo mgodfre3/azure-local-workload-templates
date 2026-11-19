@@ -107,7 +107,7 @@
             "if": { "properties": { "profile": { "const": "fileServer" } } },
             "then": {
               "required": ["dataDiskSizeGB", "fileServer"],
-              "properties": { "memoryMB": { "minimum": 4096 }, "image": { "properties": { "os": { "const": "WindowsServer2022" } } } },
+              "properties": { "memoryMB": { "minimum": 4096 }, "image": { "properties": { "os": { "enum": ["WindowsServer2022", "WindowsServer2025"] } } } },
               "not": { "anyOf": [ { "required": ["sqlServer"] }, { "required": ["sshPublicKey"] }, { "required": ["dataDisks"] } ] }
             }
           },
@@ -115,7 +115,7 @@
             "if": { "properties": { "profile": { "const": "sqlServer" } } },
             "then": {
               "required": ["dataDiskSizeGB", "sqlServer"],
-              "properties": { "memoryMB": { "minimum": 8192 }, "image": { "properties": { "os": { "const": "WindowsServer2022" } } } },
+              "properties": { "memoryMB": { "minimum": 8192 }, "image": { "properties": { "os": { "enum": ["WindowsServer2022", "WindowsServer2025"] } } } },
               "not": { "anyOf": [ { "required": ["fileServer"] }, { "required": ["sshPublicKey"] }, { "required": ["dataDisks"] } ] }
             }
           },
@@ -134,7 +134,7 @@
           {
             "if": { "properties": { "profile": { "enum": ["iisServer", "windowsApp"] } } },
             "then": {
-              "properties": { "memoryMB": { "minimum": 4096 }, "image": { "properties": { "os": { "const": "WindowsServer2022" } } } },
+              "properties": { "memoryMB": { "minimum": 4096 }, "image": { "properties": { "os": { "enum": ["WindowsServer2022", "WindowsServer2025"] } } } },
               "not": { "anyOf": [ { "required": ["fileServer"] }, { "required": ["sqlServer"] }, { "required": ["sshPublicKey"] } ] }
             }
           },
@@ -160,7 +160,7 @@
       "required": ["source", "os"],
       "properties": {
         "source": { "enum": ["existing", "marketplace", "local", "blob"] },
-        "os": { "enum": ["WindowsServer2022", "Ubuntu2204"] },
+        "os": { "enum": ["WindowsServer2022", "WindowsServer2025", "Ubuntu2204"] },
         "resourceId": { "$ref": "#/definitions/resourceId" },
         "preparedImageConfirmed": { "type": "boolean" },
         "path": { "type": "string", "minLength": 10, "maxLength": 1024 },

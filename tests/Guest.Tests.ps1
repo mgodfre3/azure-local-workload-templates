@@ -43,6 +43,21 @@ Describe 'Windows guest script' {
     }
 }
 
+Describe 'Windows server compatibility' {
+    It 'accepts Windows Server 2022 and 2025 without accepting desktop builds' {
+        foreach ($build in @('20348', '26100')) {
+            { Assert-WindowsServerVersion ([pscustomobject]@{ BuildNumber = $build; ProductType = 3 }) } | Should -Not -Throw
+            { Assert-WindowsServerVersion ([pscustomobject]@{ BuildNumber = $build; ProductType = 1 }) } | Should -Throw '*Windows Server*'
+        }
+    }
+    It 'rejects other or missing server versions before workload changes' {
+        foreach ($build in @('17763', '26200', $null)) {
+            { Assert-WindowsServerVersion ([pscustomobject]@{ BuildNumber = $build; ProductType = 3 }) } | Should -Throw '*Windows Server*'
+        }
+        { Assert-WindowsServerVersion ([pscustomobject]@{ BuildNumber = '26100'; ProductType = $null }) } | Should -Throw '*Windows Server*'
+    }
+}
+
 Describe 'IIS site safety' {
     BeforeEach {
         $sites = @([pscustomobject]@{ Name = 'Default Web Site'; physicalPath = '%SystemDrive%\inetpub\wwwroot' })

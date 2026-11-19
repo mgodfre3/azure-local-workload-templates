@@ -436,12 +436,18 @@ function Set-SqlServer($Config, $Admin) {
     Set-WorkloadFirewall 1433 $Config.allowedCidrs
 }
 
+function Assert-WindowsServerVersion($OperatingSystem) {
+    if ($OperatingSystem.BuildNumber -notin @('20348', '26100') -or $OperatingSystem.ProductType -notin @(2, 3)) {
+        throw 'Windows Server 2022 or 2025 is required.'
+    }
+}
+
 function Invoke-WorkloadConfiguration([string]$Payload) {
     $ErrorActionPreference = 'Stop'
     $c = Read-WorkloadConfiguration $Payload
     if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-18' -or ![Environment]::Is64BitProcess) { throw 'Run using 64-bit Windows PowerShell as SYSTEM.' }
     $os = Get-CimInstance Win32_OperatingSystem
-    if ($os.BuildNumber -ne '20348' -or $os.ProductType -eq 1) { throw 'Windows Server 2022 is required.' }
+    Assert-WindowsServerVersion $os
     Assert-NoRestart
     $admin = Get-LocalUser -Name $c.adminUsername
     $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544')

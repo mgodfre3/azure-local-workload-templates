@@ -84,6 +84,40 @@ Describe 'Answer contract and pure validation' {
             { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
         }
 
+        It 'accepts explicit existing Windows 2022 and 2025 images for every Windows profile' {
+            $path = Join-Path $TestDrive 'windows-existing.json'
+            foreach ($profile in @('fileServer', 'sqlServer', 'iisServer', 'windowsApp')) {
+                foreach ($os in @('WindowsServer2022', 'WindowsServer2025')) {
+                    $a = New-Answers
+                    $sample = Get-Content (Join-Path $script:Root 'answers\example.json') -Raw | ConvertFrom-Json -AsHashtable
+                    $a.workloads = @($sample.workloads | Where-Object profile -EQ $profile)
+                    $a.workloads[0].count = 1
+                    $a.workloads[0].image = @{
+                        source = 'existing'; os = $os
+                        resourceId = "/subscriptions/$($a.subscriptionId)/resourceGroups/images/providers/Microsoft.AzureStackHCI/marketplaceGalleryImages/windows-existing"
+                    }
+                    if ($profile -eq 'sqlServer') {
+                        $a.workloads[0].sqlServer.installerUrl = 'https://media.contoso.invalid/sql.iso'
+                        $a.workloads[0].sqlServer.installerSha256 = 'a' * 64
+                    }
+                    Write-Answers $a $path
+                    (Read-WorkloadAnswers $path).workloads[0].image.os | Should -Be $os
+                }
+            }
+        }
+
+        It 'keeps Windows 2025 out of Marketplace imports and Linux profile answers' {
+            $path = Join-Path $TestDrive 'windows-version-mismatch.json'
+            $a = New-Answers
+            $a.workloads[0].image.os = 'WindowsServer2025'
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+            $a = New-LinuxAnswers
+            $a.workloads[0].image.os = 'WindowsServer2025'
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+        }
+
         It 'rejects invalid sizes and unsupported Windows SQL editions' {
             $a = New-Answers
             $a.workloads[0].memoryMB = 3000
