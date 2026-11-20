@@ -7,6 +7,8 @@ fail() { echo "Linux image acceptance failed: $1" >&2; exit 1; }
 command -v cloud-init >/dev/null || fail "cloud-init is missing"
 timeout 180 cloud-init status --wait >/dev/null 2>&1 || fail "cloud-init did not finish cleanly"
 [ "$(cloud-id)" = nocloud ] || fail "NoCloud onboarding was not observed"
+timeout 30 cloud-init schema --config-file /var/lib/cloud/instance/user-data.txt >/dev/null 2>&1 ||
+    fail "generated cloud-init user data schema is invalid"
 user='__ADMIN_USERNAME__'
 home=$(getent passwd "$user" | cut -d: -f6)
 [ "$home" = "/home/$user" ] || fail "unexpected administrator home"

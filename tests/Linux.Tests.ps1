@@ -5,7 +5,7 @@ BeforeAll {
     function Invoke-LinuxAcceptance {
         param(
             [string]$Version = '24.04', [string]$ExpectedVersion = '24.04',
-            [int]$CloudExit = 0, [string]$CloudId = 'nocloud',
+            [int]$CloudExit = 0, [int]$SchemaExit = 0, [string]$CloudId = 'nocloud',
             [switch]$WrongKey, [switch]$InheritedKey, [switch]$PasswordEnabled,
             [switch]$SocketOnly, [switch]$SshInactive, [switch]$StartFailure, [switch]$UnlockedPassword
         )
@@ -21,7 +21,7 @@ BeforeAll {
         if ($InheritedKey) { [IO.File]::WriteAllText((Join-Path $rootSsh 'authorized_keys'), "ssh-rsa inherited`n") }
         $mocks = @'
 id() { echo 0; }
-cloud-init() { return __CLOUD_EXIT__; }
+cloud-init() { if [ "$1" = schema ]; then return __SCHEMA_EXIT__; fi; return __CLOUD_EXIT__; }
 cloud-id() { echo '__CLOUD_ID__'; }
 timeout() { shift; "$@"; }
 getent() { echo 'vmadmin:x:1000:1000::__ROOT__/home/vmadmin:/bin/bash'; }
@@ -36,7 +36,7 @@ systemctl() {
         *) return 1 ;;
     esac
 }
-'@.Replace('__CLOUD_EXIT__', "$CloudExit").Replace('__CLOUD_ID__', $CloudId).
+'@.Replace('__CLOUD_EXIT__', "$CloudExit").Replace('__SCHEMA_EXIT__', "$SchemaExit").Replace('__CLOUD_ID__', $CloudId).
             Replace('__ROOT__', $unixRoot).Replace('__PASSWORD__', $(if ($PasswordEnabled) { 'yes' } else { 'no' })).
             Replace('__SSH_ACTIVE__', $(if ($SocketOnly -or $SshInactive) { '1' } else { '0' })).
             Replace('__SOCKET_EXIT__', $(if ($SshInactive) { '1' } else { '0' })).
@@ -65,6 +65,12 @@ Describe 'Linux guest acceptance (isolated Bash fixtures)' {
         (Invoke-LinuxAcceptance -CloudExit 2).ExitCode | Should -Be 1
         (Invoke-LinuxAcceptance -Version '22.04').ExitCode | Should -Be 1
         (Invoke-LinuxAcceptance -CloudId 'azure').ExitCode | Should -Be 1
+    }
+    It 'rejects malformed generated user data even when cloud-init reports clean completion, before SSH activation' {
+        $result = Invoke-LinuxAcceptance -SchemaExit 1 -SocketOnly
+        $result.ExitCode | Should -Be 1
+        $result.Output | Should -Match 'generated cloud-init user data schema is invalid'
+        $result.Output | Should -Not -Match 'ssh-start-attempted'
     }
     It 'rejects unexpected or inherited keys and password-enabled SSH' {
         (Invoke-LinuxAcceptance -WrongKey).Output | Should -Match 'SSH keys differ'
