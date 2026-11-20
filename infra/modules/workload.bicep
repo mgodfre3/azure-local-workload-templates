@@ -11,11 +11,11 @@ param deploymentSet string
 param runId string
 
 var isLinux = workload.isLinux
-var ownership = {
+var ownership = union(workload.tags, {
   project: 'azure-local-workload-templates'
   deploymentSet: deploymentSet
   configurationHash: workload.configurationHash
-}
+})
 
 resource workspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' existing = {
   scope: resourceGroup(split(workspaceId, '/')[2], split(workspaceId, '/')[4])
@@ -138,6 +138,9 @@ resource configure 'Microsoft.HybridCompute/machines/extensions@2024-07-10' = if
     typeHandlerVersion: isLinux ? '2.1' : '1.10'
     autoUpgradeMinorVersion: true
     forceUpdateTag: runId
+    settings: isLinux ? {} : {
+      timestamp: runId
+    }
     protectedSettings: workload.guestSettings
   }
   dependsOn: [

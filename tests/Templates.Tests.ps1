@@ -35,6 +35,15 @@ Describe 'Compiled ARM deployment contract' {
         $os | Should -Not -Match 'customData|cloud-config|write_files'
     }
 
+    It 'merges workload metadata into all existing ownership-tagged resources without tagging VM instances' {
+        $workload.variables.ownership | Should -Match 'union\('
+        $workload.variables.ownership | Should -Match '\.tags'
+        foreach ($type in @('Microsoft.HybridCompute/machines', 'Microsoft.AzureStackHCI/networkInterfaces', 'Microsoft.AzureStackHCI/virtualHardDisks')) {
+            @($workload.resources | Where-Object type -EQ $type)[0].tags | Should -Be "[variables('ownership')]"
+        }
+        @($workload.resources | Where-Object type -EQ 'Microsoft.AzureStackHCI/virtualMachineInstances')[0].ContainsKey('tags') | Should -BeFalse
+    }
+
     It 'uses the supplied storage container for the data disk and VM configuration' {
         $disk = @($workload.resources | Where-Object type -EQ 'Microsoft.AzureStackHCI/virtualHardDisks')[0]
         $disk.properties.containerId | Should -Match "parameters\('storageContainerId'\)"
@@ -67,6 +76,14 @@ Describe 'Compiled ARM deployment contract' {
         $association.properties.dataCollectionRuleId | Should -Match 'dataCollectionRules'
         $rule = @($monitoring.resources | Where-Object type -EQ 'Microsoft.Insights/dataCollectionRules')[0]
         $rule.properties.destinations.logAnalytics[0].workspaceResourceId | Should -Match "parameters\('workspaceId'\)"
+    }
+
+    It 'retriggers Windows configuration with a public timestamp while retaining a protected payload' {
+        $configure = @($workload.resources | Where-Object type -EQ 'Microsoft.HybridCompute/machines/extensions')[0]
+        ($configure.properties.settings | ConvertTo-Json -Depth 10) | Should -Match 'timestamp'
+        ($configure.properties.settings | ConvertTo-Json -Depth 10) | Should -Match 'runId'
+        ($configure.properties.settings | ConvertTo-Json -Depth 10) | Should -Not -Match 'guestSettings|password'
+        $configure.properties.protectedSettings | Should -Match '\.guestSettings'
     }
 
     It 'places DCRs with the workspace while keeping AMA in the machine region' {

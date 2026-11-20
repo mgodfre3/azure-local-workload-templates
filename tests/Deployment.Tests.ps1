@@ -7,6 +7,7 @@ Describe 'Answer contract and pure validation' {
         BeforeAll {
             function script:New-Answers {
                 $a = Get-Content (Join-Path $script:Root 'answers\example.json') -Raw | ConvertFrom-Json -AsHashtable
+                $a.Remove('namingPrefix')
                 $a.workloads = @($a.workloads[0])
                 $a.workloads[0].Remove('count')
                 $a.workloads[0].name = 'files-01'
@@ -286,6 +287,63 @@ Describe 'Answer contract and pure validation' {
 
 Describe 'Counted profiles and capacity planning' {
     InModuleScope WorkloadDeployment {
+        It 'includes the prefix and separators in final-name length and stable scale-out' {
+            $a = New-Answers
+            $w = $a.workloads[0]
+            $w.name = 'SQL'; $w.count = 1
+            $first = @(Expand-Workloads @($w) 'BOS')[0]
+            $first.name | Should -BeExactly 'BOS-SQL-01'
+            $w.count = 2
+            $grown = @(Expand-Workloads @($w) 'BOS')
+            $grown.name | Should -Be @('BOS-SQL-01', 'BOS-SQL-02')
+            (Get-ConfigurationHash $a $first '/image') | Should -Be (Get-ConfigurationHash $a $grown[0] '/image')
+            $w.name = 'abcdefgh'
+            @(Expand-Workloads @($w) 'BOS')[0].name.Length | Should -Be 15
+            $w.name = 'abcdefghi'
+            { Expand-Workloads @($w) 'BOS' } | Should -Throw '*15 characters*'
+            $other = $w.Clone(); $other.name = 'ABC'
+            $w.name = 'abc'
+            { Expand-Workloads @($w, $other) 'BOS' } | Should -Throw '*unique*'
+        }
+
+        It 'reads the prefix from the answer and rejects malformed prefix and protected metadata' {
+            $a = New-Answers
+            $a.namingPrefix = 'BOS'
+            $path = Join-Path $TestDrive 'prefix.json'
+            Write-Answers $a $path
+            (Read-WorkloadAnswers $path).workloads[0].name | Should -BeExactly 'BOS-files-01'
+            $a.namingPrefix = 'bad prefix'
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+            $a.namingPrefix = 'BOS'
+            $a.tags['PROJECT'] = 'another-owner'
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*reserved*'
+            $a.tags.Remove('PROJECT')
+            $a.tags['Date Built'] = 'today'
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*auto*'
+        }
+
+        It 'preserves original build dates during later additions and keeps metadata out of ownership hashes' {
+            $a = New-Answers
+            $hash = Get-ConfigurationHash $a $a.workloads[0] '/image'
+            $existing = @{ tags = @{ 'Date Built' = '2025-01-02'; CostCenter = 'retained' } }
+            $a.tags = @{ Function = 'WorkloadFleet'; 'Created By' = 'Test Operator'; 'Date Built' = 'auto' }
+            $tags = Get-WorkloadTags $a $existing
+            $tags['Date Built'] | Should -Be '2025-01-02'
+            $tags['Created By'] | Should -Be 'Test Operator'
+            $tags.CostCenter | Should -Be 'retained'
+            (Get-WorkloadTags $a $null)['Date Built'] | Should -Be ([DateTime]::UtcNow.ToString('yyyy-MM-dd'))
+            (Get-WorkloadTags $a @{ systemData = @{ createdAt = '2025-01-02T23:59:00Z' } })['Date Built'] | Should -Be '2025-01-02'
+            { Get-WorkloadTags $a @{ tags = @{} } } | Should -Throw '*creation date*'
+            { Get-WorkloadTags $a @{ tags = @{ 'Date Built' = '2025-02-30' } } } | Should -Throw '*calendar date*'
+            (Get-ConfigurationHash $a $a.workloads[0] '/image') | Should -Be $hash
+            $a.tags['Date Built'] | Should -Be 'auto'
+            $a.Remove('tags')
+            { Assert-Answers $a } | Should -Not -Throw
+        }
+
         It 'expands explicit counts to stable names and leaves legacy single names unchanged' {
             $a = New-Answers
             @(Expand-Workloads $a.workloads)[0].name | Should -Be 'files-01'
@@ -425,6 +483,68 @@ Describe 'Counted profiles and capacity planning' {
             (Get-ConfigurationHash $a $w '/images/id') | Should -Be $hash
             $w.dataDisks[0].sizeGB = 128
             (Get-ConfigurationHash $a $w '/images/id') | Should -Not -Be $hash
+        }
+    }
+}
+
+Describe 'Explicit existing AzPowerShell authentication' {
+    InModuleScope WorkloadDeployment {
+        BeforeAll {
+            function script:Get-AzContext { param([switch]$ListAvailable) }
+            function script:Get-AzAccessToken { param($ResourceUrl, $TenantId, $DefaultProfile) }
+        }
+        BeforeEach {
+            $script:authContext = [pscustomobject]@{
+                Subscription = [pscustomobject]@{ Id = 'requested-subscription' }
+                Tenant = [pscustomobject]@{ Id = 'requested-tenant' }
+                Environment = [pscustomobject]@{ Name = 'AzureCloud' }
+                Account = [pscustomobject]@{ Id = 'selected-account' }
+            }
+            Mock Import-Module {} -ParameterFilter { $Name -eq 'Az.Accounts' }
+            Mock Invoke-AzJson { throw 'CLI must not be used by explicit AzPowerShell authentication' }
+            Mock Get-AzContext { $script:authContext }
+        }
+        AfterEach { Close-ArmConnection }
+
+        It 'uses the already-selected matching context and obtains only its ARM token' {
+            Mock Get-AzAccessToken {
+                [pscustomobject]@{
+                    Token = (ConvertTo-SecureString 'fake-arm-token' -AsPlainText -Force)
+                    ExpiresOn = [DateTimeOffset]::UtcNow.AddHours(1)
+                }
+            }
+            Open-ArmConnection 'requested-subscription' 'AzPowerShell'
+            $token = Get-ArmToken
+            $token.accessToken | Should -Be 'fake-arm-token'
+            $token.expires_on | Should -BeGreaterThan ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+            Should -Invoke Get-AzAccessToken -Times 1 -ParameterFilter {
+                $ResourceUrl -eq 'https://management.azure.com/' -and
+                $TenantId -eq 'requested-tenant' -and $DefaultProfile -eq $script:authContext
+            }
+            Should -Invoke Invoke-AzJson -Times 0
+        }
+
+        It 'refuses a different current subscription when matching identities are ambiguous' {
+            Mock Get-AzContext {
+                if (!$ListAvailable) { return $null }
+                $script:authContext
+                [pscustomobject]@{
+                    Subscription = $script:authContext.Subscription
+                    Tenant = $script:authContext.Tenant
+                    Environment = $script:authContext.Environment
+                    Account = [pscustomobject]@{ Id = 'different-account' }
+                }
+            }
+            { Open-ArmConnection 'requested-subscription' 'AzPowerShell' } | Should -Throw '*unambiguous*'
+            Should -Invoke Invoke-AzJson -Times 0
+        }
+
+        It 'does not fall back or reflect secret-bearing token errors' {
+            Open-ArmConnection 'requested-subscription' 'AzPowerShell'
+            Mock Get-AzAccessToken { throw 'sensitive-provider-error' }
+            { Get-ArmToken } | Should -Throw '*AzPowerShell ARM token acquisition failed*'
+            try { Get-ArmToken } catch { $_.Exception.Message | Should -Not -Match 'sensitive-provider-error' }
+            Should -Invoke Invoke-AzJson -Times 0
         }
     }
 }
@@ -866,7 +986,7 @@ Describe 'Guest delivery and deployment boundaries' {
             Mock Open-ArmConnection {}
             Mock Close-ArmConnection {}
             Mock Invoke-WorkloadPreflight {
-                foreach ($item in $Answers.workloads) { @{ workloadName = $item.name; imageId = '/images/prepared'; import = $false } }
+                foreach ($item in $Answers.workloads) { @{ workloadName = $item.name; imageId = '/images/prepared'; import = $false; tags = (Get-WorkloadTags $Answers $null) } }
             }
             Mock Get-CompiledTemplate { @{} }
             Mock Get-WindowsGuestArtifact { throw 'Must not read Windows script' }
@@ -932,7 +1052,7 @@ Describe 'Guest delivery and deployment boundaries' {
             Mock Read-WorkloadAnswers { $a }
             Mock Open-ArmConnection {}
             Mock Close-ArmConnection {}
-            Mock Invoke-WorkloadPreflight { @(@{ workloadName = 'files-01'; imageId = '/images/id'; import = $false }) }
+            Mock Invoke-WorkloadPreflight { @(@{ workloadName = 'files-01'; imageId = '/images/id'; import = $false; tags = (Get-WorkloadTags $a $null) }) }
             Mock Get-WindowsGuestArtifact { @{ uri = 'https://raw.githubusercontent.com/example/repo/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/guest/Configure-Windows.ps1'; sha256 = 'a' * 64 } }
             Mock Assert-PublicGuestArtifact {}
             Mock Get-CompiledTemplate { @{ parameters = @{ adminPassword = @{ type = 'secureString' } } } }
@@ -958,7 +1078,7 @@ Describe 'Guest delivery and deployment boundaries' {
             Mock Read-WorkloadAnswers { $a }
             Mock Open-ArmConnection {}
             Mock Close-ArmConnection {}
-            Mock Invoke-WorkloadPreflight { @(@{ workloadName = 'files-01'; imageId = '/images/id'; import = $true }) }
+            Mock Invoke-WorkloadPreflight { @(@{ workloadName = 'files-01'; imageId = '/images/id'; import = $true; tags = (Get-WorkloadTags $a $null) }) }
             Mock Get-WindowsGuestArtifact { @{ uri = 'https://raw.githubusercontent.com/example/repo/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/guest/Configure-Windows.ps1'; sha256 = 'a' * 64 } }
             Mock Assert-PublicGuestArtifact {}
             Mock Get-CompiledTemplate { @{} }

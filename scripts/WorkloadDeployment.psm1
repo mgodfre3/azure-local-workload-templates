@@ -6,6 +6,8 @@ $script:Arm = 'https://management.azure.com'
 $script:Client = $null
 $script:TokenExpires = [DateTimeOffset]::MinValue
 $script:Subscription = ''
+$script:Authentication = 'AzureCli'
+$script:AzContext = $null
 
 function Invoke-AzJson {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -88,7 +90,7 @@ function Read-WorkloadAnswers {
     }
     $answers = $json | ConvertFrom-Json -AsHashtable
     Assert-Answers $answers
-    $answers.workloads = @(Expand-Workloads $answers.workloads)
+    $answers.workloads = @(Expand-Workloads $answers.workloads $answers['namingPrefix'])
     $answers
 }
 
@@ -107,7 +109,7 @@ function Get-WorkloadDisks {
 }
 
 function Expand-Workloads {
-    param([array]$Workloads)
+    param([array]$Workloads, [string]$NamingPrefix = '')
     $instances = @()
     $names = @{}
     $ips = @{}
@@ -127,6 +129,8 @@ function Expand-Workloads {
             $item.Remove('count')
             $item.Remove('privateIpAddresses')
             if ($entry.ContainsKey('count')) { $item.name = '{0}-{1:00}' -f $entry.name, ($i + 1) }
+            if ($NamingPrefix) { $item.name = "$NamingPrefix-$($item.name)" }
+            if ($item.name.Length -gt 15) { throw 'Final VM names including prefix, separators and instance suffix must be at most 15 characters.' }
             if ($names.ContainsKey($item.name)) { throw 'Expanded VM names must be unique; a counted name collides with another entry.' }
             $names[$item.name] = $true
             if ($entry.ContainsKey('privateIpAddresses')) { $item.privateIpAddress = $entry.privateIpAddresses[$i] }
@@ -183,6 +187,10 @@ function Assert-PreparedImageSource {
 
 function Assert-Answers {
     param([hashtable]$Answers)
+    foreach ($key in $(if ($Answers['tags']) { @($Answers.tags.Keys) } else { @() })) {
+        if ($key -in @('project', 'deploymentSet', 'configurationHash')) { throw 'Ownership tags are reserved and cannot be supplied in answers.' }
+        if ($key -eq 'Date Built' -and $Answers.tags[$key] -cne 'auto') { throw 'Date Built must be auto; actual creation dates are preserved by the launcher.' }
+    }
     $sub = $Answers.subscriptionId
     Assert-ResourceId $Answers.stamp.clusterResourceId 'Microsoft\.AzureStackHCI/clusters' $sub
     Assert-ResourceId $Answers.stamp.customLocationId 'Microsoft\.ExtendedLocation/customLocations' $sub
@@ -252,14 +260,29 @@ function Assert-Answers {
             }
         }
     }
-    $null = @(Expand-Workloads $Answers.workloads)
+    $null = @(Expand-Workloads $Answers.workloads $Answers['namingPrefix'])
 }
 
 function Open-ArmConnection {
-    param([string]$SubscriptionId)
-    $account = Invoke-AzJson @('account', 'show', '--subscription', $SubscriptionId)
-    if ($account.environmentName -ne 'AzureCloud' -or $account.state -ne 'Enabled') {
-        throw 'Version 1 supports enabled Azure public-cloud subscriptions only.'
+    param([string]$SubscriptionId, [ValidateSet('AzureCli', 'AzPowerShell')][string]$Authentication = 'AzureCli')
+    $script:Authentication = $Authentication
+    if ($Authentication -eq 'AzPowerShell') {
+        Import-Module Az.Accounts -MinimumVersion 5.0 -ErrorAction Stop
+        $current = Get-AzContext
+        $contexts = @(Get-AzContext -ListAvailable | Where-Object { $_.Subscription.Id -eq $SubscriptionId })
+        $identities = @($contexts | Group-Object { "$($_.Environment.Name)|$($_.Tenant.Id)|$($_.Account.Id)" })
+        if ($current -and $current.Subscription.Id -eq $SubscriptionId -and $current.Environment.Name -eq 'AzureCloud') {
+            $script:AzContext = $current
+        } elseif ($identities.Count -eq 1 -and $contexts[0].Environment.Name -eq 'AzureCloud') {
+            $script:AzContext = $contexts[0]
+        } else {
+            throw 'AzPowerShell requires an unambiguous existing AzureCloud context for the requested subscription. Sign in explicitly; no global context is changed.'
+        }
+    } else {
+        $account = Invoke-AzJson @('account', 'show', '--subscription', $SubscriptionId)
+        if ($account.environmentName -ne 'AzureCloud' -or $account.state -ne 'Enabled') {
+            throw 'Version 1 supports enabled Azure public-cloud subscriptions only.'
+        }
     }
     $script:Subscription = $SubscriptionId
     $script:Client = [Net.Http.HttpClient]::new()
@@ -270,6 +293,24 @@ function Open-ArmConnection {
 function Close-ArmConnection {
     if ($null -ne $script:Client) { $script:Client.Dispose(); $script:Client = $null }
     $script:TokenExpires = [DateTimeOffset]::MinValue
+    $script:AzContext = $null
+    $script:Authentication = 'AzureCli'
+}
+
+function Get-ArmToken {
+    if ($script:Authentication -eq 'AzureCli') {
+        return Invoke-AzJson @('account', 'get-access-token', '--subscription', $script:Subscription, '--resource', "$script:Arm/")
+    }
+    $result = $null
+    try {
+        $result = Get-AzAccessToken -ResourceUrl "$script:Arm/" -TenantId $script:AzContext.Tenant.Id -DefaultProfile $script:AzContext -ErrorAction Stop
+        if ($result.Token -isnot [Security.SecureString] -or !$result.Token.Length) { throw 'Expected a protected ARM token.' }
+        @{
+            accessToken = [Net.NetworkCredential]::new('', $result.Token).Password
+            expires_on = $result.ExpiresOn.ToUnixTimeSeconds()
+        }
+    } catch { throw 'AzPowerShell ARM token acquisition failed. Reauthenticate the requested subscription context; no alternate account or authentication mode was selected.' }
+    finally { if ($result -and $result.Token -is [Security.SecureString]) { $result.Token.Dispose() } }
 }
 
 function Invoke-ArmRequest {
@@ -281,7 +322,7 @@ function Invoke-ArmRequest {
         [switch]$CreateOnly
     )
     if ($script:TokenExpires -lt [DateTimeOffset]::UtcNow.AddMinutes(5)) {
-        $token = Invoke-AzJson @('account', 'get-access-token', '--subscription', $script:Subscription, '--resource', "$script:Arm/")
+        $token = Get-ArmToken
         $script:Client.DefaultRequestHeaders.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $token.accessToken)
         $script:TokenExpires = [DateTimeOffset]::FromUnixTimeSeconds([long]$token.expires_on)
         $token = $null
@@ -475,6 +516,35 @@ function Assert-OwnedResource {
     }
 }
 
+function Get-WorkloadTags {
+    param([hashtable]$Answers, [hashtable]$ExistingMachine)
+    $tags = @{}
+    if ($ExistingMachine -and $ExistingMachine['tags']) {
+        foreach ($key in $ExistingMachine.tags.Keys) { $tags[$key] = $ExistingMachine.tags[$key] }
+    }
+    if ($Answers['tags']) {
+        foreach ($key in $Answers.tags.Keys) { $tags[$key] = $Answers.tags[$key] }
+    }
+    $built = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
+    if ($ExistingMachine) {
+        if ($ExistingMachine['tags'] -and $ExistingMachine.tags['Date Built']) {
+            $built = $ExistingMachine.tags['Date Built']
+        } elseif ($ExistingMachine['systemData'] -and $ExistingMachine.systemData['createdAt']) {
+            $built = ([DateTimeOffset]::Parse($ExistingMachine.systemData.createdAt)).UtcDateTime.ToString('yyyy-MM-dd')
+        } else {
+            throw 'Existing workload has no verifiable creation date. Refusing to relabel it as newly built.'
+        }
+    }
+    $date = [DateTime]::MinValue
+    if (![DateTime]::TryParseExact($built, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::None, [ref]$date)) { throw 'Existing Date Built tag must be an ISO calendar date.' }
+    $tags['Date Built'] = $built
+    if (@($tags.Keys | Where-Object { $_ -notin @('project', 'deploymentSet', 'configurationHash') }).Count -gt 47) {
+        throw 'Merged workload metadata exceeds the Azure 50-tag limit including ownership tags.'
+    }
+    $tags
+}
+
 function Assert-VmMatchesConfiguration {
     param([hashtable]$Vm, [hashtable]$Workload, [string]$ImageId, [string]$ResourceGroupId)
     if ($null -eq $Vm) { return }
@@ -572,6 +642,7 @@ function Invoke-WorkloadPreflight {
     foreach ($workload in $Answers.workloads) {
         $resolved = $plan | Where-Object workloadName -EQ $workload.name
         $hash = Get-ConfigurationHash $Answers $workload $resolved.imageId
+        $existingMachine = $null
         foreach ($entry in @(
             @("Microsoft.HybridCompute/machines/$($workload.name)", '2024-07-10'),
             @("Microsoft.AzureStackHCI/networkInterfaces/$($workload.name)-nic", '2024-01-01'),
@@ -580,6 +651,7 @@ function Invoke-WorkloadPreflight {
             $resource = Get-ArmResource "$rgId/providers/$($entry[0])" $entry[1] -AllowNotFound
             Assert-OwnedResource $resource $Answers.deploymentName $hash
             if ($null -ne $resource -and $entry[0] -like 'Microsoft.HybridCompute/machines/*') {
+                $existingMachine = $resource
                 $vm = Get-ArmResource "$($resource.id)/providers/Microsoft.AzureStackHCI/virtualMachineInstances/default" -AllowNotFound
                 Assert-VmMatchesConfiguration $vm $workload $resolved.imageId $rgId
             }
@@ -591,6 +663,7 @@ function Invoke-WorkloadPreflight {
                 throw 'Existing data disk has size or storage-path drift. No disk resizing or replacement is performed.'
             }
         }
+        $resolved.tags = Get-WorkloadTags $Answers $existingMachine
     }
     $plan
 }
@@ -813,6 +886,7 @@ function Start-WorkloadDeployment {
         [Parameter(Mandatory)][string]$AnswerFile,
         [ValidateSet('Validate', 'Preflight', 'Deploy')][string]$Mode = 'Validate',
         [ValidateRange(60, 21600)][int]$TimeoutSeconds = 10800,
+        [ValidateSet('AzureCli', 'AzPowerShell')][string]$Authentication = 'AzureCli',
         [switch]$AllowUnverifiedExistingLinuxImage
     )
     $answers = Read-WorkloadAnswers $AnswerFile
@@ -832,7 +906,7 @@ function Start-WorkloadDeployment {
     if ($Mode -eq 'Validate') { Write-Output 'Answer file is valid. Offline only; Azure resources, capacity, RBAC and guest readiness have not been checked.'; return }
     if (!$answers.workloads.Count) { Write-Output 'All workload counts are zero. No Azure connection, imports, password reads or deployments were performed.'; return }
     try {
-        Open-ArmConnection $answers.subscriptionId
+        Open-ArmConnection $answers.subscriptionId $Authentication
         $plan = @(Invoke-WorkloadPreflight $answers)
         $plan | ForEach-Object { Write-Output "$($_.workloadName): $(if ($_.import) { 'import missing image' } else { 'reuse existing image' })" }
         if ($Mode -eq 'Preflight' -or !$PSCmdlet.ShouldProcess($answers.resourceGroup, 'Import missing images and deploy Arc-enabled workloads and billable monitoring')) { return }
@@ -854,6 +928,7 @@ function Start-WorkloadDeployment {
                 sshPublicKey = if ($workload.ContainsKey('sshPublicKey')) { $workload.sshPublicKey } else { '' }
                 imageId = $image.imageId
                 configurationHash = Get-ConfigurationHash $answers $workload $image.imageId
+                tags = $image.tags
                 guestSettings = Get-GuestSettings $answers $workload
             }
         }

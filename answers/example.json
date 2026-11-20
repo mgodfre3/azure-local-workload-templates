@@ -2,6 +2,12 @@
   "$schema": "./schema.json",
   "schemaVersion": 1,
   "deploymentName": "branch-office",
+  "namingPrefix": "LAB",
+  "tags": {
+    "Function": "WorkloadFleet",
+    "Created By": "<operator>",
+    "Date Built": "auto"
+  },
   "subscriptionId": "00000000-0000-0000-0000-000000000000",
   "resourceGroup": "rg-workloads",
   "location": "eastus",

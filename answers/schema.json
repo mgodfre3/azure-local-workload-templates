@@ -8,6 +8,13 @@
     "$schema": { "type": "string" },
     "schemaVersion": { "const": 1 },
     "deploymentName": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,23}$" },
+    "namingPrefix": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9]{0,7}$", "description": "Optional VM/computer-name prefix. Final prefix-name-index must be at most 15 characters; no truncation." },
+    "tags": {
+      "type": "object", "maxProperties": 46,
+      "propertyNames": { "pattern": "^[^<>%&\\\\?/]{1,512}$" },
+      "additionalProperties": { "type": "string", "maxLength": 256 },
+      "description": "Nonsecret workload metadata. Ownership fields are reserved. Date Built, if supplied, must be auto; the launcher preserves the original creation date."
+    },
     "subscriptionId": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$" },
     "resourceGroup": { "type": "string", "pattern": "^(?!.*\\.$)[a-zA-Z0-9_().-]{1,90}$" },
     "location": { "type": "string", "pattern": "^[a-z][a-z0-9]+$" },
@@ -57,7 +64,7 @@
         "type": "object", "additionalProperties": false,
         "required": ["name", "profile", "processors", "memoryMB", "allowedCidrs", "image"],
         "properties": {
-          "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,13}[a-z0-9]$" },
+          "name": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9-]{0,13}[a-zA-Z0-9]$" },
           "profile": { "enum": ["fileServer", "sqlServer", "webServer", "iisServer", "windowsApp", "linuxApp"] },
           "count": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Omit for a legacy single VM with the exact name. Explicit counts use name-01, name-02, etc., including count 1. Zero disables the entry." },
           "processors": { "type": "integer", "minimum": 2, "maximum": 64 },
