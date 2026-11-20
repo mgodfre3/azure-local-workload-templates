@@ -93,6 +93,12 @@
             "items": { "type": "string", "pattern": "^[0-9]{1,3}(\\.[0-9]{1,3}){3}/([89]|[12][0-9]|3[0-2])$" }
           },
           "sshPublicKey": { "type": "string", "maxLength": 4096, "pattern": "^ssh-rsa [A-Za-z0-9+/=]+( [^\\r\\n]+)?$" },
+          "windowsPreparation": {
+            "type": "object", "additionalProperties": false,
+            "required": ["scopeInheritedFirewall"],
+            "properties": { "scopeInheritedFirewall": { "type": "boolean" } },
+            "description": "Explicit guest-only opt-in: narrow local inherited inbound rules intersecting the service port to allowedCidrs, retaining other constraints and a protected snapshot. Unsupported/GPO rules fail closed."
+          },
           "image": { "$ref": "#/definitions/image" },
           "fileServer": {
             "type": "object", "additionalProperties": false, "required": ["shareName"],
@@ -178,7 +184,7 @@
             "then": {
               "required": ["sshPublicKey"],
               "properties": { "image": { "properties": { "source": { "enum": ["existing", "local", "blob"] }, "os": { "enum": ["Ubuntu2204", "Ubuntu2404"] }, "preparedImageConfirmed": { "const": true } }, "anyOf": [ { "required": ["preparedImageConfirmed"] }, { "required": ["pilotGuestValidation"] } ] } },
-              "not": { "anyOf": [ { "required": ["dataDiskSizeGB"] }, { "required": ["fileServer"] }, { "required": ["sqlServer"] } ] }
+              "not": { "anyOf": [ { "required": ["dataDiskSizeGB"] }, { "required": ["fileServer"] }, { "required": ["sqlServer"] }, { "required": ["windowsPreparation"] } ] }
             }
           },
           {
@@ -198,7 +204,7 @@
           },
           {
             "if": { "properties": { "profile": { "const": "windowsApp" } } },
-            "then": { "not": { "required": ["dataDiskSizeGB"] } }
+            "then": { "not": { "anyOf": [ { "required": ["dataDiskSizeGB"] }, { "required": ["windowsPreparation"] } ] } }
           }
         ]
       }

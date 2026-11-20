@@ -790,6 +790,7 @@ function Get-GuestSettings {
         return @{ script = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($scriptText -replace "`r`n", "`n"))) }
     }
     $config.dataDiskSizeGB = $Workload.dataDiskSizeGB
+    if ($Workload.ContainsKey('windowsPreparation')) { $config.windowsPreparation = $Workload.windowsPreparation }
     if ($Workload.profile -in @('fileServer', 'sqlServer')) { $config[$Workload.profile] = $Workload[$Workload.profile] }
     $encodedConfig = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($config | ConvertTo-Json -Depth 10 -Compress)))
     $artifact = Get-WindowsGuestArtifact

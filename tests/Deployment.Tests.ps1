@@ -77,6 +77,23 @@ Describe 'Answer contract and pure validation' {
             Should -Invoke Invoke-AzJson -Times 0
         }
 
+        It 'limits inherited firewall preparation to explicitly selected Windows service profiles' {
+            $a = New-Answers
+            $a.workloads[0].windowsPreparation = @{ scopeInheritedFirewall = $true }
+            $path = Join-Path $TestDrive 'windows-preparation.json'
+            Write-Answers $a $path
+            (Read-WorkloadAnswers $path).workloads[0].windowsPreparation.scopeInheritedFirewall | Should -BeTrue
+            $a.workloads[0].profile = 'windowsApp'
+            $a.workloads[0].Remove('fileServer')
+            $a.workloads[0].Remove('dataDiskSizeGB')
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+            $a = New-LinuxAnswers
+            $a.workloads[0].windowsPreparation = @{ scopeInheritedFirewall = $true }
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+        }
+
         It 'rejects a plaintext password rather than silently ignoring it' {
             $a = New-Answers
             $a.password = 'not-a-real-secret'
@@ -1027,6 +1044,17 @@ Describe 'Guest delivery and deployment boundaries' {
             $settings.commandToExecute.Length | Should -BeLessOrEqual 8100
             $settings.commandToExecute | Should -Match 'Get-FileHash'
             $settings.fileUris[0] | Should -Match '/a{40}/guest/'
+        }
+
+        It 'forwards only the explicit firewall preparation opt-in to the protected guest payload' {
+            $a = New-Answers
+            $a.workloads[0].windowsPreparation = @{ scopeInheritedFirewall = $true }
+            Mock Get-WindowsGuestArtifact { @{ uri = 'https://raw.githubusercontent.com/example/repo/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/guest/Configure-Windows.ps1'; sha256 = 'a' * 64 } }
+            $settings = Get-GuestSettings $a $a.workloads[0]
+            $settings.commandToExecute -match "-ConfigurationBase64 '([^']+)'" | Should -BeTrue
+            $payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches[1])) | ConvertFrom-Json
+            $payload.windowsPreparation.scopeInheritedFirewall | Should -BeTrue
+            $payload.allowedCidrs | Should -Be $a.workloads[0].allowedCidrs
         }
 
         It 'refuses a dirty Windows script before creating an executable artifact URL' {

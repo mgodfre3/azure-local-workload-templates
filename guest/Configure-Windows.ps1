@@ -47,7 +47,7 @@ function Read-WorkloadConfiguration([string]$Payload) {
         $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
         $c = $utf8.GetString($bytes) | ConvertFrom-Json -ErrorAction Stop
     } catch { throw 'ConfigurationBase64 must contain valid UTF8 JSON.' }
-    Assert-Keys $c @('profile', 'adminUsername', 'allowedCidrs', 'dataDiskSizeGB', 'fileServer', 'sqlServer')
+    Assert-Keys $c @('profile', 'adminUsername', 'allowedCidrs', 'dataDiskSizeGB', 'fileServer', 'sqlServer', 'windowsPreparation')
     if ($c.profile -cnotin @('fileServer', 'sqlServer', 'iisServer') -or
         $c.adminUsername -cnotmatch '^[A-Za-z][A-Za-z0-9_-]{0,19}$' -or
         ($c.dataDiskSizeGB -isnot [int] -and $c.dataDiskSizeGB -isnot [long]) -or
@@ -56,6 +56,10 @@ function Read-WorkloadConfiguration([string]$Payload) {
     foreach ($cidr in $c.allowedCidrs) {
         if ($cidr -isnot [string]) { throw 'Invalid CIDR type.' }
         $null = Get-CidrRange $cidr
+    }
+    if ($null -ne $c.windowsPreparation) {
+        Assert-Keys $c.windowsPreparation @('scopeInheritedFirewall')
+        if ($c.windowsPreparation.scopeInheritedFirewall -isnot [bool]) { throw 'scopeInheritedFirewall must be a boolean.' }
     }
     if ($null -ne $c.fileServer) { Assert-Keys $c.fileServer @('shareName') }
     if ($null -ne $c.sqlServer) {
@@ -233,6 +237,66 @@ function Set-WorkloadFirewall([int]$Port, [string[]]$Cidrs) {
         throw 'Workload firewall rule is not effective.'
     }
     Assert-ScopedFirewall $Port $Cidrs
+}
+
+function Get-NarrowedRemoteScope([string[]]$RemoteAddresses, [string[]]$Cidrs) {
+    if (!$RemoteAddresses.Count) { throw 'Inherited firewall rule has no remote scope.' }
+    $intersections = @()
+    foreach ($remote in $RemoteAddresses) {
+        if ($remote -in @('Any', '*')) { $intersections += $Cidrs; continue }
+        $candidate = if ($remote -match '/') { $remote } else { "$remote/32" }
+        try { $range = Get-CidrRange $candidate -AllowSubnetMask }
+        catch { throw 'Inherited firewall scope is not an explicit IPv4 network; resolve that policy manually.' }
+        foreach ($cidr in $Cidrs) {
+            $allowed = Get-CidrRange $cidr
+            if ($range[0] -ge $allowed[0] -and $range[1] -le $allowed[1]) { $intersections += $remote }
+            elseif ($allowed[0] -ge $range[0] -and $allowed[1] -le $range[1]) { $intersections += $cidr }
+        }
+    }
+    @($intersections | Sort-Object -Unique)
+}
+
+function Set-InheritedFirewallScope([int]$Port, [string[]]$Cidrs) {
+    foreach ($profile in Get-NetFirewallProfile -PolicyStore ActiveStore) {
+        if (!$profile.Enabled -or $profile.DefaultInboundAction -ne 'Block') { throw 'All firewall profiles must be enabled with default inbound Block.' }
+    }
+    $plan = @()
+    foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Allow) {
+        $filter = $rule | Get-NetFirewallPortFilter
+        if ($filter.Protocol -notin @('TCP', '6', 'Any', '256')) { continue }
+        $matchesPort = @($filter.LocalPort | Where-Object {
+            $_ -in @('Any', '*', "$Port") -or
+            ($_ -match '^(\d+)-(\d+)$' -and $Port -ge [int]$Matches[1] -and $Port -le [int]$Matches[2])
+        }).Count -gt 0
+        if (!$matchesPort) { continue }
+        $addresses = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
+        $narrowed = @(Get-NarrowedRemoteScope $addresses $Cidrs)
+        if ((($addresses | Sort-Object) -join '|') -eq (($narrowed | Sort-Object) -join '|')) { continue }
+        if ($rule.PolicyStoreSourceType -ne 'Local') { throw 'Inherited service-port exposure is controlled outside the guest local policy; no policy was changed.' }
+        $persistent = @(Get-NetFirewallRule -PolicyStore PersistentStore -Name $rule.Name -ErrorAction Stop)
+        if ($persistent.Count -ne 1 -or $persistent[0].Direction -ne 'Inbound' -or
+            $persistent[0].Action -ne 'Allow' -or $persistent[0].Enabled -ne 'True') { throw 'Inherited firewall rule changed or is not uniquely local.' }
+        # These dynamic Windows rules cannot take a static remote filter. Disabling only narrows access.
+        $disable = !$narrowed.Count -or $rule.Name -in @('WirelessDisplay-In-TCP', 'WiFiDirect-KM-Driver-In-TCP')
+        $plan += @{ name=$rule.Name; remote=$narrowed; disable=$disable; original=$persistent[0]; address=($rule | Get-NetFirewallAddressFilter)
+            port=$filter; application=($rule | Get-NetFirewallApplicationFilter); service=($rule | Get-NetFirewallServiceFilter) }
+    }
+    if (!$plan.Count) { return }
+    $directory = Join-Path "$env:ProgramData\AzureLocalWorkload\Firewall" ([guid]::NewGuid().ToString())
+    Set-PrivateDirectory $directory @()
+    $plan | Export-Clixml -LiteralPath (Join-Path $directory 'before.clixml') -Depth 12
+    foreach ($item in $plan) {
+        $current = Get-NetFirewallRule -PolicyStore PersistentStore -Name $item.name -ErrorAction Stop
+        $remote = @(($current | Get-NetFirewallAddressFilter).RemoteAddress)
+        if ((($remote | Sort-Object) -join '|') -ne (($item.address.RemoteAddress | Sort-Object) -join '|') -or
+            $current.Enabled -ne 'True' -or $current.Direction -ne 'Inbound' -or $current.Action -ne 'Allow') {
+            throw 'Inherited firewall policy changed during preparation; inspect the protected snapshot.'
+        }
+        if ($item.disable) { Disable-NetFirewallRule -PolicyStore PersistentStore -Name $item.name | Out-Null }
+        else { Set-NetFirewallRule -PolicyStore PersistentStore -Name $item.name -RemoteAddress $item.remote | Out-Null }
+    }
+    Assert-ScopedFirewall $Port $Cidrs
+    Write-Output 'Explicitly approved local inherited firewall scopes narrowed; protected before-snapshot retained. No host or Azure firewall policy was changed.'
 }
 
 function Set-FileServer($Config, $Admin) {
@@ -614,6 +678,7 @@ function Invoke-WorkloadConfiguration([string]$Payload) {
     $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544')
     if (!$admin.Enabled -or $admin.SID.Value -notin $members.SID.Value) { throw 'adminUsername must be an enabled local Administrator.' }
     $port = switch ($c.profile) { 'fileServer' { 445 } 'sqlServer' { 1433 } 'iisServer' { 80 } }
+    if ($c.windowsPreparation.scopeInheritedFirewall -eq $true) { Set-InheritedFirewallScope $port $c.allowedCidrs }
     Assert-ScopedFirewall $port $c.allowedCidrs
     if ($c.profile -eq 'sqlServer' -and $c.sqlServer.installationMode -eq 'marketplace') {
         Assert-MarketplaceSqlInstance $c

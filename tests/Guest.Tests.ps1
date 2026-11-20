@@ -108,6 +108,81 @@ Describe 'Windows firewall address normalization' {
     }
 }
 
+Describe 'Explicit inherited firewall preparation' {
+    BeforeAll {
+        function Get-NetFirewallProfile { param($PolicyStore) }
+        function Get-NetFirewallRule { param($PolicyStore, $Enabled, $Direction, $Action, $Name) }
+        function Get-NetFirewallPortFilter { param([Parameter(ValueFromPipeline)]$InputObject) }
+        function Get-NetFirewallAddressFilter { param([Parameter(ValueFromPipeline)]$InputObject) }
+        function Get-NetFirewallApplicationFilter { param([Parameter(ValueFromPipeline)]$InputObject) }
+        function Get-NetFirewallServiceFilter { param([Parameter(ValueFromPipeline)]$InputObject) }
+        function Set-NetFirewallRule { param($PolicyStore, $Name, $RemoteAddress) }
+        function Disable-NetFirewallRule { param($PolicyStore, $Name) }
+    }
+    It 'requires a typed opt-in and leaves it absent by default' {
+        $c = New-Config
+        $parsed = Read-WorkloadConfiguration (New-Payload $c)
+        $parsed.PSObject.Properties.Name | Should -Not -Contain 'windowsPreparation'
+        $c.windowsPreparation = @{ scopeInheritedFirewall = $true }
+        (Read-WorkloadConfiguration (New-Payload $c)).windowsPreparation.scopeInheritedFirewall | Should -BeTrue
+        $c.windowsPreparation.scopeInheritedFirewall = 'true'
+        { Read-WorkloadConfiguration (New-Payload $c) } | Should -Throw '*boolean*'
+        $c.windowsPreparation = @{ scopeInheritedFirewall = $true; disableFirewall = $true }
+        { Read-WorkloadConfiguration (New-Payload $c) } | Should -Throw '*Unsupported configuration property*'
+    }
+    It 'intersects inherited networks without widening an existing host or narrower subnet' {
+        @(Get-NarrowedRemoteScope @('Any') @('192.0.2.0/24')) | Should -Be @('192.0.2.0/24')
+        @(Get-NarrowedRemoteScope @('192.0.0.0/16') @('192.0.2.0/24')) | Should -Be @('192.0.2.0/24')
+        @(Get-NarrowedRemoteScope @('192.0.2.19', '192.0.2.128/25') @('192.0.2.0/24')) |
+            Should -Be @('192.0.2.128/25', '192.0.2.19')
+        @(Get-NarrowedRemoteScope @('198.51.100.0/24') @('192.0.2.0/24')).Count | Should -Be 0
+    }
+    It 'rejects ambiguous keyword, IPv6 and invalid address scopes instead of replacing them with a broader subnet' {
+        foreach ($scope in @('LocalSubnet', 'Internet', '::/0', '192.0.2.1/24')) {
+            { Get-NarrowedRemoteScope @($scope) @('192.0.2.0/24') } | Should -Throw '*resolve that policy manually*'
+        }
+        { Get-NarrowedRemoteScope @() @('192.0.2.0/24') } | Should -Throw '*no remote scope*'
+    }
+    Context 'Local policy execution' {
+        BeforeEach {
+            $env:ProgramData = $TestDrive
+            Mock Get-NetFirewallProfile { [pscustomobject]@{ Enabled=$true; DefaultInboundAction='Block' } }
+            Mock Get-NetFirewallRule { [pscustomobject]@{ Name='broad-local'; PolicyStoreSourceType='Local'; Enabled='True'; Direction='Inbound'; Action='Allow' } }
+            Mock Get-NetFirewallPortFilter { [pscustomobject]@{ Protocol='TCP'; LocalPort='Any' } }
+            Mock Get-NetFirewallAddressFilter { [pscustomobject]@{ RemoteAddress=@('Any') } }
+            Mock Get-NetFirewallApplicationFilter { [pscustomobject]@{ Program='C:\Windows\service.exe' } }
+            Mock Get-NetFirewallServiceFilter { [pscustomobject]@{ Service='ExampleService' } }
+            Mock Set-PrivateDirectory { param($Path) $null = New-Item -ItemType Directory -Path $Path -Force }
+            Mock Set-NetFirewallRule {}
+            Mock Disable-NetFirewallRule {}
+            Mock Assert-ScopedFirewall {}
+        }
+        It 'snapshots local rules then changes only their remote addresses and rechecks effective policy' {
+            Set-InheritedFirewallScope 445 @('192.0.2.0/24')
+            @(Get-ChildItem $TestDrive -Filter before.clixml -Recurse).Count | Should -Be 1
+            Should -Invoke Set-NetFirewallRule -Times 1 -Exactly -ParameterFilter {
+                $PolicyStore -eq 'PersistentStore' -and $Name -eq 'broad-local' -and
+                $RemoteAddress.Count -eq 1 -and $RemoteAddress[0] -eq '192.0.2.0/24'
+            }
+            Should -Invoke Disable-NetFirewallRule -Times 0
+            Should -Invoke Assert-ScopedFirewall -Times 1
+        }
+        It 'does not modify any rule when external policy needs remediation' {
+            Mock Get-NetFirewallRule { [pscustomobject]@{ Name='gpo'; PolicyStoreSourceType='GroupPolicy'; Enabled='True'; Direction='Inbound'; Action='Allow' } }
+            { Set-InheritedFirewallScope 80 @('192.0.2.0/24') } | Should -Throw '*controlled outside*'
+            Should -Invoke Set-NetFirewallRule -Times 0
+            Should -Invoke Disable-NetFirewallRule -Times 0
+        }
+        It 'disables only the conflicting dynamic rule instead of attempting an unsupported static filter' {
+            Mock Get-NetFirewallRule { [pscustomobject]@{ Name='WirelessDisplay-In-TCP'; PolicyStoreSourceType='Local'; Enabled='True'; Direction='Inbound'; Action='Allow' } }
+            Set-InheritedFirewallScope 80 @('192.0.2.0/24')
+            Should -Invoke Disable-NetFirewallRule -Times 1 -Exactly -ParameterFilter { $Name -eq 'WirelessDisplay-In-TCP' -and $PolicyStore -eq 'PersistentStore' }
+            Should -Invoke Set-NetFirewallRule -Times 0
+        }
+        AfterEach { $env:ProgramData = [Environment]::GetFolderPath('CommonApplicationData') }
+    }
+}
+
 Describe 'Safe workload disk selection (pure inventory)' {
     BeforeEach {
         $disk = [pscustomobject]@{ Number = 1; Size = 128GB; IsBoot = $false; IsSystem = $false; PartitionStyle = 'RAW' }
