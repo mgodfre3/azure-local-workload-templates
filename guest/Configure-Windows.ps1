@@ -58,21 +58,30 @@ function Read-WorkloadConfiguration([string]$Payload) {
         $null = Get-CidrRange $cidr
     }
     if ($null -ne $c.windowsPreparation) {
-        Assert-Keys $c.windowsPreparation @('scopeInheritedFirewall')
+        Assert-Keys $c.windowsPreparation @('scopeInheritedFirewall', 'restartIfRequired')
         if ($c.windowsPreparation.scopeInheritedFirewall -isnot [bool]) { throw 'scopeInheritedFirewall must be a boolean.' }
+        if ($c.windowsPreparation.PSObject.Properties.Name -contains 'restartIfRequired' -and
+            $c.windowsPreparation.restartIfRequired -isnot [bool]) { throw 'restartIfRequired must be a boolean.' }
     }
     if ($null -ne $c.fileServer) { Assert-Keys $c.fileServer @('shareName') }
     if ($null -ne $c.sqlServer) {
-        Assert-Keys $c.sqlServer @('installationMode', 'installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed', 'productKeySource')
+        Assert-Keys $c.sqlServer @('installationMode', 'installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed', 'productKeySource', 'administratorPolicy', 'clientAccess')
     }
     if ($c.profile -eq 'fileServer') {
         Assert-Keys $c.fileServer @('shareName')
         if ($c.fileServer.shareName -cnotmatch '^[A-Za-z][A-Za-z0-9_-]{0,63}$' -or
             $c.fileServer.shareName -in @('ADMIN', 'IPC', 'print')) { throw 'Invalid SMB share name.' }
     } elseif ($c.profile -eq 'sqlServer') {
-        Assert-Keys $c.sqlServer @('installationMode', 'installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed', 'productKeySource')
+        Assert-Keys $c.sqlServer @('installationMode', 'installerUrl', 'installerSha256', 'edition', 'acceptLicenseTerms', 'productionLicenseConfirmed', 'productKeySource', 'administratorPolicy', 'clientAccess')
         $s = $c.sqlServer
         $marketplace = $s.installationMode -ceq 'marketplace'
+        if ($s.PSObject.Properties.Name -contains 'administratorPolicy' -and
+            (!$marketplace -or $s.administratorPolicy -cnotin @('grantIfAuthorized', 'recoverEmptyInstance', 'recoverDisposableInstance'))) {
+            throw 'administratorPolicy requires an explicit supported Marketplace policy.'
+        }
+        if ($s.PSObject.Properties.Name -contains 'clientAccess' -and
+            (!$marketplace -or $s.clientAccess -isnot [bool])) { throw 'clientAccess requires a Marketplace boolean.' }
+        if ($s.clientAccess -eq $true -and !$s.administratorPolicy) { throw 'Marketplace client access requires an explicit administratorPolicy.' }
         if ($s.PSObject.Properties.Name -contains 'installationMode' -and $s.installationMode -cnotin @('iso', 'marketplace')) {
             throw 'Unsupported SQL installationMode.'
         }
@@ -150,12 +159,40 @@ function Initialize-WorkloadData([long]$SizeGB) {
     $null = Select-WorkloadDisk @(Get-Disk) @(Get-Partition) @(Get-Volume) $SizeGB
 }
 
-function Assert-NoRestart {
-    if ((Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+function Test-PendingRestart {
+    return [bool]((Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
         (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
-        (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations) {
+        (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations)
+}
+
+function Assert-NoRestart {
+    if (Test-PendingRestart) {
         throw 'A Windows restart is required. Restart manually, then rerun the extension; no automatic reboot was attempted.'
     }
+}
+
+function Invoke-WorkloadPreparation([string]$Payload) {
+    $ErrorActionPreference = 'Stop'
+    $c = Read-WorkloadConfiguration $Payload
+    if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-18' -or ![Environment]::Is64BitProcess) { throw 'Run using 64-bit Windows PowerShell as SYSTEM.' }
+    Assert-WindowsServerVersion (Get-CimInstance Win32_OperatingSystem)
+    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+    if (!(Test-PendingRestart)) { return @{ bootUtc = $boot; restartScheduled = $false } }
+    if ($c.windowsPreparation.restartIfRequired -ne $true) { Assert-NoRestart }
+    if (@(Get-SmbSession).Count) { throw 'Active SMB sessions prevent an automatic guest restart.' }
+    if ($c.profile -eq 'sqlServer' -and (Get-Service MSSQLSERVER -ErrorAction SilentlyContinue)) {
+        if ($c.sqlServer.administratorPolicy -ceq 'recoverDisposableInstance') {
+            Assert-DisposableSqlRecoveryImage
+            $null = Get-SqlRestartServiceState
+        } else { Assert-EmptyIdleSqlInstance }
+    }
+    $task = 'AzureLocalWorkload-Restart-' + [guid]::NewGuid().ToString('N')
+    $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\shutdown.exe" -Argument '/r /t 0 /d p:4:1'
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(45)
+    $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+    $null = Register-ScheduledTask -TaskName $task -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+    return @{ bootUtc = $boot; restartScheduled = $true; task = $task }
 }
 
 function Set-PrivateDirectory([string]$Path, [string[]]$Sids) {
@@ -301,7 +338,8 @@ function Set-InheritedFirewallScope([int]$Port, [string[]]$Cidrs) {
 
 function Set-FileServer($Config, $Admin) {
     $feature = Install-WindowsFeature FS-FileServer
-    if (!$feature.Success -or $feature.RestartNeeded -ne 'No') { throw 'File server role requires a restart or installation failed; rerun after manual recovery.' }
+    if (!$feature.Success) { throw 'File server role installation failed; no restart was requested.' }
+    if ($feature.RestartNeeded -ne 'No') { throw 'A Windows restart is required. File server role installation completed.' }
     Assert-ScopedFirewall 445 $Config.allowedCidrs
     $path = "E:\Shares\$($Config.fileServer.shareName)"
     Set-PrivateDirectory 'E:\Shares' @($Admin.SID.Value)
@@ -340,7 +378,8 @@ function Set-IisServer($Config) {
     Get-NetFirewallRule -PolicyStore PersistentStore |
         Where-Object Name -in @('IIS-WebServerRole-HTTP-In-TCP', 'IIS-WebServerRole-HTTPS-In-TCP') |
         Disable-NetFirewallRule | Out-Null
-    if (!$feature.Success -or $feature.RestartNeeded -ne 'No') { throw 'IIS role requires a restart or installation failed; rerun after manual recovery.' }
+    if (!$feature.Success) { throw 'IIS role installation failed; no restart was requested.' }
+    if ($feature.RestartNeeded -ne 'No') { throw 'A Windows restart is required. IIS role installation completed.' }
     Import-Module WebAdministration -ErrorAction Stop
     Assert-IisLayout @(Get-Website) @(Get-WebBinding -Name 'Default Web Site')
     $path = 'E:\Iis'
@@ -367,9 +406,11 @@ function Set-IisServer($Config) {
     if ($response.StatusCode -ne 200 -or $response.Content.Trim() -ne $content) { throw 'IIS local HTTP readiness failed.' }
 }
 
-function Get-SqlResult([string]$Query, [string]$Server = 'lpc:.') {
-    for ($i = 0; $i -lt 12; $i++) {
-        $connection = New-Object System.Data.SqlClient.SqlConnection("Server=$Server;Integrated Security=SSPI;Encrypt=True;TrustServerCertificate=True;Connect Timeout=5")
+function Get-SqlResult([string]$Query, [string]$Server = 'lpc:.',
+    [ValidateSet('AzureLocalWorkload', 'SQLCMD')][string]$ApplicationName = 'AzureLocalWorkload',
+    [ValidateRange(1, 12)][int]$Attempts = 12, [switch]$ClassifyLoginFailure) {
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        $connection = New-Object System.Data.SqlClient.SqlConnection("Server=$Server;Integrated Security=SSPI;Encrypt=True;TrustServerCertificate=True;Connect Timeout=5;Application Name=$ApplicationName")
         try {
             $connection.Open()
             $command = $connection.CreateCommand()
@@ -380,7 +421,14 @@ function Get-SqlResult([string]$Query, [string]$Server = 'lpc:.') {
             $table.Load($reader)
             return ,$table
         } catch {
-            if ($i -eq 11) { throw 'SQL integrated query readiness failed after bounded retry.' }
+            if ($ClassifyLoginFailure) {
+                $failure = $_.Exception.GetBaseException()
+                if ($failure -is [System.Data.SqlClient.SqlException]) {
+                    if ($failure.Number -eq 18461) { throw [InvalidOperationException]::new('An existing SQL single-user instance requires operator recovery.') }
+                    if ($failure.Number -eq 18456) { throw [UnauthorizedAccessException]::new('Normal-mode SQL login denied; credentials and SQL responses are suppressed.') }
+                }
+            }
+            if ($i -eq $Attempts - 1) { throw 'SQL integrated query readiness failed after bounded retry.' }
         } finally { $connection.Dispose() }
         Start-Sleep -Seconds 5
     }
@@ -527,7 +575,238 @@ CONVERT(int,SERVERPROPERTY('IsIntegratedSecurityOnly')) AS WindowsOnly,
         throw 'Preinstalled SQL 2022 Enterprise, Windows authentication or online-database acceptance failed; no reinstall, key injection or database relocation was attempted.'
     }
     Assert-ScopedFirewall 1433 $Config.allowedCidrs
-    Write-Output 'Preinstalled SQL 2022 Enterprise local integrated query and database acceptance passed. Image database paths and extra RAW disks were preserved; no SQL listener or firewall rule was changed. Verify administrator/client access and licensing separately.'
+    Write-Output 'Preinstalled SQL 2022 Enterprise local integrated query and database acceptance passed. Image database paths and extra RAW disks were preserved; licensing remains operator-confirmed.'
+}
+
+function Assert-EmptyIdleSqlInstance {
+    $visibility = (Get-SqlResult @"
+SELECT HAS_PERMS_BY_NAME(NULL,NULL,N'VIEW ANY DATABASE') AS ViewDatabases,
+HAS_PERMS_BY_NAME(NULL,NULL,N'ALTER ANY DATABASE') AS ViewOfflineDatabases,
+HAS_PERMS_BY_NAME(NULL,NULL,N'VIEW SERVER PERFORMANCE STATE') AS ViewSessions,
+CAST(SERVERPROPERTY('IsSingleUser') AS int) AS SingleUser
+"@).Rows[0]
+    if ($visibility.ViewDatabases -ne 1 -or $visibility.ViewOfflineDatabases -ne 1 -or
+        $visibility.ViewSessions -ne 1 -or $visibility.SingleUser -ne 0) {
+        throw 'SQL recovery/restart cannot verify the complete normal-mode database/session inventory with current permissions; no disruptive operation was started.'
+    }
+    $row = (Get-SqlResult @"
+SELECT (SELECT COUNT(*) FROM sys.databases WHERE database_id > 4) AS UserDatabases,
+(SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE is_user_process=1 AND session_id<>@@SPID
+ AND (open_transaction_count>0 OR status<>N'sleeping')) AS ActiveSessions
+"@).Rows[0]
+    if ($row.UserDatabases -ne 0 -or $row.ActiveSessions -ne 0) {
+        throw 'SQL recovery/restart requires an empty instance with no active user sessions or transactions.'
+    }
+}
+
+function Get-SqlRestartServiceState {
+    $server = Get-Service MSSQLSERVER
+    $agent = Get-Service SQLSERVERAGENT
+    if ($server.Status -ne 'Running' -or $agent.Status -notin @('Running', 'Stopped') -or
+        @($server.DependentServices | Where-Object { $_.Status -eq 'Running' -and $_.ServiceName -ne 'SQLSERVERAGENT' }).Count) {
+        throw 'Unexpected SQL/dependent service state; restart/recovery refused.'
+    }
+    if ((Get-CimInstance Win32_Service -Filter "Name='MSSQLSERVER'").StartName -ne 'NT Service\MSSQLSERVER') {
+        throw 'Unexpected SQL service identity; restart/recovery refused.'
+    }
+    @{ server = $server; agent = $agent; agentWasRunning = $agent.Status -eq 'Running' }
+}
+
+function Set-MarketplaceSqlAdministrator($Sql, $Admin) {
+    $account = "$env:COMPUTERNAME\$($Admin.Name)"
+    $escaped = $account.Replace("'", "''")
+    $system = ([Security.Principal.SecurityIdentifier]'S-1-5-18').Translate([Security.Principal.NTAccount]).Value.Replace("'", "''")
+    $rolesQuery = "SELECT IS_SRVROLEMEMBER(N'sysadmin',N'$escaped') AS AdminRole, IS_SRVROLEMEMBER(N'sysadmin',N'$system') AS SystemRole, IS_SRVROLEMEMBER(N'sysadmin') AS CurrentRole, CAST(SERVERPROPERTY('IsSingleUser') AS int) AS SingleUser"
+    $roles = $null
+    try { $roles = (Get-SqlResult $rolesQuery -Attempts 1 -ClassifyLoginFailure).Rows[0] }
+    catch [UnauthorizedAccessException] {
+        if ($Sql.administratorPolicy -cne 'recoverDisposableInstance') { throw }
+        Write-Output 'Normal-mode SQL login is unavailable; the explicit disposable-instance policy permits bounded recovery.'
+    }
+    if ($roles -and $roles.SingleUser -ne 0) { throw 'An existing single-user instance requires operator recovery; no new recovery was started.' }
+    if ($roles.AdminRole -eq 1 -and $roles.SystemRole -eq 1) { return }
+    $grant = @"
+DECLARE @name sysname, @q nvarchar(max);
+DECLARE names CURSOR LOCAL FAST_FORWARD FOR SELECT N'$escaped' UNION ALL SELECT N'$system';
+OPEN names; FETCH NEXT FROM names INTO @name;
+WHILE @@FETCH_STATUS=0 BEGIN
+ IF SUSER_ID(@name) IS NULL BEGIN SET @q=N'CREATE LOGIN '+QUOTENAME(@name)+N' FROM WINDOWS'; EXEC(@q); END;
+ IF IS_SRVROLEMEMBER(N'sysadmin',@name)<>1 BEGIN SET @q=N'ALTER SERVER ROLE sysadmin ADD MEMBER '+QUOTENAME(@name); EXEC(@q); END;
+ FETCH NEXT FROM names INTO @name;
+END;
+CLOSE names; DEALLOCATE names;
+SELECT 1 AS Granted;
+"@
+    if ($roles.CurrentRole -eq 1) {
+        $null = Get-SqlResult $grant
+    } else {
+        if ($Sql.administratorPolicy -cnotin @('recoverEmptyInstance', 'recoverDisposableInstance')) {
+            throw 'SYSTEM lacks SQL sysadmin authority. An explicit recovery policy is required; no service was stopped.'
+        }
+        if ($Sql.administratorPolicy -ceq 'recoverEmptyInstance') { Assert-EmptyIdleSqlInstance }
+        Invoke-EmptySqlAdministratorRecovery $grant -Disposable:($Sql.administratorPolicy -ceq 'recoverDisposableInstance')
+    }
+    $after = (Get-SqlResult $rolesQuery).Rows[0]
+    if ($after.AdminRole -ne 1 -or $after.SystemRole -ne 1 -or $after.SingleUser -ne 0) {
+        throw 'Normal-mode intended-administrator/SYSTEM SQL sysadmin acceptance failed.'
+    }
+}
+
+function Assert-DisposableSqlRecoveryImage {
+    $base = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL16.MSSQLSERVER'
+    $setup = Get-ItemProperty -LiteralPath "$base\Setup"
+    $mode = Get-ItemProperty -LiteralPath "$base\MSSQLServer"
+    $parameters = Get-ItemProperty -LiteralPath "$base\MSSQLServer\Parameters"
+    if ($setup.Version -notmatch '^16\.' -or $setup.Edition -notlike 'Enterprise Edition*' -or $mode.LoginMode -ne 1 -or
+        @($parameters.PSObject.Properties | Where-Object { $_.Name -match '^SQLArg\d+$' -and $_.Value -match '^\s*[-/][mf]' }).Count) {
+        throw 'Disposable recovery requires the declared SQL 2022 Enterprise Windows-authenticated default instance with no persisted single-user/minimal startup flag.'
+    }
+}
+
+function Invoke-EmptySqlAdministratorRecovery([string]$Grant, [switch]$Disposable) {
+    # Supported lockout procedure, explicitly limited to an empty disposable instance:
+    # https://learn.microsoft.com/sql/database-engine/configure-windows/connect-to-sql-server-when-system-administrators-are-locked-out
+    if ($Disposable) { Assert-DisposableSqlRecoveryImage }
+    else { Assert-EmptyIdleSqlInstance }
+    $state = Get-SqlRestartServiceState
+    $server = $state.server
+    $agent = $state.agent
+    if ($env:COMPUTERNAME -notmatch '^[A-Za-z][A-Za-z0-9-]{0,14}$') { throw 'Unexpected SQL computer name.' }
+    $directory = Join-Path "$env:ProgramData\AzureLocalWorkloadSqlRecovery" ([guid]::NewGuid().ToString('N'))
+    Set-PrivateDirectory $directory @()
+    $marker = Join-Path $directory 'restore-required'
+    $restorePath = Join-Path $directory 'restore-normal.ps1'
+    $agentWasRunning = $state.agentWasRunning
+    $restore = @'
+$ErrorActionPreference='Stop'
+if($env:COMPUTERNAME -cne '__COMPUTER__'){throw 'Unexpected SQL restoration target.'}
+$marker='__MARKER__'
+if(!(Test-Path -LiteralPath $marker)){exit 0}
+$agent=Get-Service SQLSERVERAGENT
+if($agent.Status -eq 'Running'){$agent.Stop();$agent.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60))}
+$server=Get-Service MSSQLSERVER
+if($server.Status -eq 'StartPending'){$server.WaitForStatus('Running',[TimeSpan]::FromSeconds(60))}
+$server.Refresh()
+if($server.Status -eq 'Running'){$server.Stop()}
+$server.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60))
+$server.Start();$server.WaitForStatus('Running',[TimeSpan]::FromSeconds(90))
+if(__AGENT_RUNNING__){$agent.Start();$agent.WaitForStatus('Running',[TimeSpan]::FromSeconds(60))}
+$connection=New-Object System.Data.SqlClient.SqlConnection('Server=localhost;Integrated Security=True;Connect Timeout=15;Application Name=AzureLocalWorkloadRestore')
+try{
+ $connection.Open();$command=$connection.CreateCommand();$command.CommandTimeout=15
+ $command.CommandText="SELECT CAST(SERVERPROPERTY('IsSingleUser') AS int)"
+ if($command.ExecuteScalar()-ne 0){throw 'Normal multi-user SQL restoration was not verified.'}
+}finally{$connection.Dispose()}
+$agent.Refresh()
+if(($agent.Status-eq 'Running')-ne __AGENT_RUNNING__){throw 'Prior SQL Agent state was not restored.'}
+Remove-Item -LiteralPath $marker -ErrorAction Stop
+'@.Replace('__COMPUTER__', $env:COMPUTERNAME).Replace('__MARKER__', $marker).
+        Replace('__AGENT_RUNNING__', $(if ($agentWasRunning) { '$true' } else { '$false' }))
+    Set-Content -LiteralPath $restorePath -Value $restore -Encoding UTF8
+    @{ utc = [DateTime]::UtcNow.ToString('o'); agentWasRunning = $agentWasRunning; emptyIdleVerified = $true } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $directory 'before.json')
+    $task = 'AzureLocalWorkload-SqlRestore-' + [guid]::NewGuid().ToString('N')
+    $powershell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $action = New-ScheduledTaskAction -Execute $powershell -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$restorePath`""
+    $triggers = @((New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(12)), (New-ScheduledTaskTrigger -AtStartup))
+    $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 6)
+    $null = Register-ScheduledTask -TaskName $task -Action $action -Trigger $triggers -Principal $principal -Settings $settings
+    $null = New-Item -ItemType File -Path $marker
+    try {
+        if (!$Disposable) { Assert-EmptyIdleSqlInstance }
+        else { Write-Output 'Explicit disposable SQL recovery can interrupt sessions and roll back in-flight work; no database is deleted or relocated.' }
+        if ($agentWasRunning) { $agent.Stop(); $agent.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)) }
+        $server.Stop(); $server.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60))
+        $start = Start-Process -FilePath "$env:SystemRoot\System32\net.exe" -ArgumentList 'start MSSQLSERVER /mSQLCMD' -PassThru -WindowStyle Hidden
+        if (!$start.WaitForExit(60000)) { Stop-Process -Id $start.Id; throw 'Single-user start timed out; normal restoration is armed.' }
+        if ($start.ExitCode -ne 0) { throw 'Single-user start failed; normal restoration is armed.' }
+        $single = (Get-SqlResult @"
+SELECT CONVERT(int,SERVERPROPERTY('ProductMajorVersion')) AS Major,
+CONVERT(nvarchar(128),SERVERPROPERTY('Edition')) AS Edition,
+CONVERT(int,SERVERPROPERTY('IsIntegratedSecurityOnly')) AS WindowsOnly,
+CONVERT(int,SERVERPROPERTY('IsSingleUser')) AS SingleUser, IS_SRVROLEMEMBER(N'sysadmin') AS CurrentRole
+"@ -ApplicationName SQLCMD -Attempts 1).Rows[0]
+        if ($single.Major -ne 16 -or $single.Edition -notlike 'Enterprise Edition*' -or
+            $single.WindowsOnly -ne 1 -or $single.SingleUser -ne 1 -or $single.CurrentRole -ne 1) {
+            throw 'Temporary single-user SQL edition/authentication/administrator authority was not verified; no grants were attempted.'
+        }
+        $null = Get-SqlResult $Grant -ApplicationName SQLCMD -Attempts 1
+    } finally {
+        if (!(Invoke-SqlNormalRestore $restorePath) -or (Test-Path -LiteralPath $marker)) {
+            throw "Normal SQL restoration failed. Protected restoration watchdog retained: $task"
+        }
+        try {
+            if ((Get-SqlResult "SELECT CAST(SERVERPROPERTY('IsSingleUser') AS int) AS SingleUser").Rows[0].SingleUser -ne 0 -or
+                ((Get-Service SQLSERVERAGENT).Status -eq 'Running') -ne $agentWasRunning) {
+                throw 'Normal SQL/Agent state acceptance failed.'
+            }
+        } catch {
+            $null = New-Item -ItemType File -Path $marker -Force
+            throw "Normal multi-user SQL or prior Agent state was not verified; restoration watchdog retained: $task"
+        }
+        Unregister-ScheduledTask -TaskName $task -Confirm:$false
+    }
+}
+
+function Invoke-SqlNormalRestore([string]$Path) {
+    $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Path`"" -PassThru -WindowStyle Hidden
+    if (!$process.WaitForExit(360000)) { Stop-Process -Id $process.Id; return $false }
+    return $process.ExitCode -eq 0
+}
+
+function Set-MarketplaceSqlClientAccess($Config) {
+    $null = Get-SqlRestartServiceState
+    $browser = Get-Service SQLBrowser
+    if ($browser.Status -notin @('Running', 'Stopped') -or @($browser.DependentServices | Where-Object Status -ne 'Stopped').Count) {
+        throw 'Unexpected SQL Browser/dependent state; client configuration refused before registry changes.'
+    }
+    $base = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQLServer\SuperSocketNetLib'
+    $changes = @()
+    foreach ($setting in @(@("$base\Tcp", 'Enabled', 1), @("$base\Tcp", 'ListenOnAllIPs', 1), @("$base\Np", 'Enabled', 0))) {
+        if ((Get-ItemProperty $setting[0]).($setting[1]) -ne $setting[2]) {
+            $changes += @{ path = $setting[0]; name = $setting[1]; value = $setting[2] }
+        }
+    }
+    foreach ($ip in Get-ChildItem "$base\Tcp" | Where-Object PSChildName -like 'IP*') {
+        foreach ($setting in @(@('TcpDynamicPorts', ''), @('TcpPort', '1433'))) {
+            if ((Get-ItemProperty $ip.PSPath).($setting[0]) -cne $setting[1]) {
+                $changes += @{ path = $ip.PSPath; name = $setting[0]; value = $setting[1] }
+            }
+        }
+    }
+    $changed = $changes.Count -gt 0
+    $browserChanged = $browser.Status -ne 'Stopped' -or
+        (Get-CimInstance Win32_Service -Filter "Name='SQLBrowser'").StartMode -ne 'Disabled'
+    if (!$changed) {
+        try { $null = Get-SqlResult 'SELECT 1 AS Probe' 'tcp:localhost,1433' -Attempts 1 }
+        catch { Write-Output 'TCP listener acceptance did not pass; attempting the explicit empty-instance guarded listener restart.'; $changed = $true }
+    }
+    if ($changed -or $browserChanged) {
+        Assert-EmptyIdleSqlInstance
+        foreach ($setting in $changes) { Set-ItemProperty $setting.path -Name $setting.name -Value $setting.value }
+        if ($browser.Status -eq 'Running') { $browser.Stop(); $browser.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)) }
+        Set-Service SQLBrowser -StartupType Disabled
+    }
+    if ($changed) {
+        Assert-EmptyIdleSqlInstance
+        $state = Get-SqlRestartServiceState
+        try {
+            if ($state.agentWasRunning) { $state.agent.Stop(); $state.agent.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)) }
+            $state.server.Stop(); $state.server.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60))
+        } finally {
+            $state.server.Refresh()
+            if ($state.server.Status -eq 'StopPending') { $state.server.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)); $state.server.Refresh() }
+            if ($state.server.Status -eq 'Stopped') { $state.server.Start() }
+            $state.server.WaitForStatus('Running', [TimeSpan]::FromSeconds(90))
+            $state.agent.Refresh()
+            if ($state.agentWasRunning -and $state.agent.Status -eq 'Stopped') { $state.agent.Start() }
+            $state.agent.WaitForStatus($(if ($state.agentWasRunning) { 'Running' } else { 'Stopped' }), [TimeSpan]::FromSeconds(60))
+        }
+    }
+    $null = Get-SqlResult 'SELECT 1 AS Probe' 'tcp:localhost,1433'
+    Set-WorkloadFirewall 1433 $Config.allowedCidrs
 }
 
 function Assert-SqlProductKey([string]$Key) {
@@ -681,7 +960,18 @@ function Invoke-WorkloadConfiguration([string]$Payload) {
     if ($c.windowsPreparation.scopeInheritedFirewall -eq $true) { Set-InheritedFirewallScope $port $c.allowedCidrs }
     Assert-ScopedFirewall $port $c.allowedCidrs
     if ($c.profile -eq 'sqlServer' -and $c.sqlServer.installationMode -eq 'marketplace') {
-        Assert-MarketplaceSqlInstance $c
+        if ($c.sqlServer.administratorPolicy -ceq 'recoverDisposableInstance') {
+            Assert-DisposableSqlRecoveryImage
+            Set-MarketplaceSqlAdministrator $c.sqlServer $admin
+            Assert-MarketplaceSqlInstance $c
+        } else {
+            Assert-MarketplaceSqlInstance $c
+            if ($c.sqlServer.administratorPolicy) { Set-MarketplaceSqlAdministrator $c.sqlServer $admin }
+        }
+        if ($c.sqlServer.clientAccess -eq $true) {
+            if (!$c.sqlServer.administratorPolicy) { throw 'Marketplace client access requires an explicit administratorPolicy.' }
+            Set-MarketplaceSqlClientAccess $c
+        }
         Assert-NoRestart
         return
     }

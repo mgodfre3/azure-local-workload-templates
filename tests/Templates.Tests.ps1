@@ -77,6 +77,15 @@ Describe 'Compiled ARM deployment contract' {
         $rule = @($monitoring.resources | Where-Object type -EQ 'Microsoft.Insights/dataCollectionRules')[0]
         $rule.properties.destinations.logAnalytics[0].workspaceResourceId | Should -Match "parameters\('workspaceId'\)"
     }
+    It 'keeps legacy phase defaults and gates both services and monitoring for VM-only convergence' {
+        foreach($flag in @('configureServices','deployMonitoring')){
+            $template.parameters[$flag].defaultValue | Should -BeTrue
+            $workload.parameters[$flag].defaultValue | Should -BeTrue
+            @($template.resources)[0].properties.parameters[$flag].value | Should -Be "[parameters('$flag')]"
+        }
+        @($workload.resources | Where-Object type -EQ 'Microsoft.HybridCompute/machines/extensions')[0].condition | Should -Match "parameters\('configureServices'\)"
+        @($workload.resources | Where-Object type -EQ 'Microsoft.Resources/deployments')[0].condition | Should -Match "parameters\('deployMonitoring'\)"
+    }
 
     It 'retriggers Windows configuration with a public timestamp while retaining a protected payload' {
         $configure = @($workload.resources | Where-Object type -EQ 'Microsoft.HybridCompute/machines/extensions')[0]

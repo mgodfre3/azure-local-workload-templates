@@ -9,6 +9,8 @@ param adminPassword string
 param workload object
 param deploymentSet string
 param runId string
+param configureServices bool = true
+param deployMonitoring bool = true
 
 var isLinux = workload.isLinux
 var ownership = union(workload.tags, {
@@ -128,7 +130,7 @@ resource vm 'Microsoft.AzureStackHCI/virtualMachineInstances@2024-01-01' = {
   }
 }
 
-resource configure 'Microsoft.HybridCompute/machines/extensions@2024-07-10' = if (workload.configureGuest) {
+resource configure 'Microsoft.HybridCompute/machines/extensions@2024-07-10' = if (configureServices && workload.configureGuest) {
   parent: machine
   name: 'workload-configuration'
   location: location
@@ -148,7 +150,7 @@ resource configure 'Microsoft.HybridCompute/machines/extensions@2024-07-10' = if
   ]
 }
 
-module monitoring 'monitoring.bicep' = {
+module monitoring 'monitoring.bicep' = if (deployMonitoring) {
   name: '${workload.name}-monitoring'
   params: {
     location: location

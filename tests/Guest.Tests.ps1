@@ -58,6 +58,264 @@ Describe 'Windows server compatibility' {
     }
 }
 
+Describe 'Explicit Marketplace SQL administrator convergence' {
+    BeforeEach {
+        $sql = [pscustomobject]@{ administratorPolicy = 'grantIfAuthorized' }
+        $admin = [pscustomobject]@{ Name = 'vmadmin' }
+        $script:granted = $false
+        $script:systemRole = 1
+        Mock Get-SqlResult {
+            if ($Query -match 'DECLARE names CURSOR') {
+                $script:granted = $true
+                return [pscustomobject]@{ Rows = @([pscustomobject]@{ Granted = 1 }) }
+            }
+            [pscustomobject]@{ Rows = @([pscustomobject]@{
+                AdminRole = $(if ($script:granted) { 1 } else { 0 })
+                SystemRole = $(if ($script:granted) { 1 } else { $script:systemRole })
+                CurrentRole = $(if ($script:granted) { 1 } else { $script:systemRole })
+                SingleUser = 0
+            }) }
+        }
+        Mock Invoke-EmptySqlAdministratorRecovery { throw 'Unexpected disruptive recovery.' }
+        Mock Assert-EmptyIdleSqlInstance {}
+    }
+    It 'grants only the intended local administrator and SYSTEM using existing authority, without service recovery' {
+        Set-MarketplaceSqlAdministrator $sql $admin
+        $script:granted | Should -BeTrue
+        Should -Invoke Invoke-EmptySqlAdministratorRecovery -Times 0
+        Should -Invoke Get-SqlResult -Times 1 -ParameterFilter { $Query -match 'DECLARE names CURSOR' -and $Query -match 'QUOTENAME' }
+    }
+    It 'refuses missing grant authority without the explicit disruptive policy' {
+        $script:systemRole = 0
+        { Set-MarketplaceSqlAdministrator $sql $admin } | Should -Throw '*no service was stopped*'
+        Should -Invoke Invoke-EmptySqlAdministratorRecovery -Times 0
+    }
+    It 'uses effective group-derived sysadmin authority without unnecessary single-user recovery' {
+        Mock Get-SqlResult {
+            if($Query -match 'DECLARE names CURSOR'){$script:granted=$true;return [pscustomobject]@{Rows=@([pscustomobject]@{Granted=1})}}
+            [pscustomobject]@{Rows=@([pscustomobject]@{AdminRole=$(if($script:granted){1}else{0});SystemRole=$(if($script:granted){1}else{0});CurrentRole=1;SingleUser=0})}
+        }
+        Set-MarketplaceSqlAdministrator $sql $admin
+        Should -Invoke Invoke-EmptySqlAdministratorRecovery -Times 0
+        $script:granted | Should -BeTrue
+    }
+    It 'runs guarded recovery only for explicit recoverEmptyInstance and verifies normal-mode roles afterwards' {
+        $script:systemRole = 0
+        $sql.administratorPolicy = 'recoverEmptyInstance'
+        Mock Invoke-EmptySqlAdministratorRecovery { $script:granted = $true }
+        Set-MarketplaceSqlAdministrator $sql $admin
+        Should -Invoke Assert-EmptyIdleSqlInstance -Times 1
+        Should -Invoke Invoke-EmptySqlAdministratorRecovery -Times 1
+        Should -Invoke Get-SqlResult -Times 2
+    }
+    It 'does not reinterpret an already single-user instance as permission to recover' {
+        Mock Get-SqlResult { [pscustomobject]@{Rows=@([pscustomobject]@{AdminRole=0;SystemRole=0;SingleUser=1})} }
+        $sql.administratorPolicy = 'recoverEmptyInstance'
+        { Set-MarketplaceSqlAdministrator $sql $admin } | Should -Throw '*operator recovery*'
+        Should -Invoke Invoke-EmptySqlAdministratorRecovery -Times 0
+    }
+    It 'bootstraps a denied normal-mode login only with the explicitly disposable policy' {
+        $sql.administratorPolicy='recoverDisposableInstance'
+        Mock Get-SqlResult {
+            if(!$script:granted){throw [UnauthorizedAccessException]::new('Normal-mode SQL login denied.')}
+            [pscustomobject]@{Rows=@([pscustomobject]@{AdminRole=1;SystemRole=1;SingleUser=0})}
+        }
+        Mock Invoke-EmptySqlAdministratorRecovery {$script:granted=$true}
+        Set-MarketplaceSqlAdministrator $sql $admin
+        Should -Invoke Invoke-EmptySqlAdministratorRecovery -Times 1 -ParameterFilter {$Disposable}
+        Should -Invoke Assert-EmptyIdleSqlInstance -Times 0
+    }
+    It 'does not treat arbitrary SQL errors or existing single-user access failures as disposable recovery authorization' {
+        $sql.administratorPolicy='recoverDisposableInstance'
+        Mock Get-SqlResult {throw [InvalidOperationException]::new('Existing single-user or unexpected SQL failure.')}
+        {Set-MarketplaceSqlAdministrator $sql $admin} | Should -Throw '*unexpected SQL failure*'
+        Should -Invoke Invoke-EmptySqlAdministratorRecovery -Times 0
+    }
+}
+
+Describe 'SQL disruptive recovery preconditions' {
+    It 'refuses user databases or active sessions before reading/stopping services or changing listener settings' {
+        Mock Get-Service { throw 'Must not read services after failed empty/idle preconditions.' }
+        Mock Set-ItemProperty { throw 'Must not alter SQL registry after failed empty/idle preconditions.' }
+        foreach ($row in @(@{UserDatabases=1;ActiveSessions=0}, @{UserDatabases=0;ActiveSessions=1})) {
+            Mock Get-SqlResult {
+                if ($Query -match 'HAS_PERMS_BY_NAME') {
+                    return [pscustomobject]@{Rows=@([pscustomobject]@{ViewDatabases=1;ViewOfflineDatabases=1;ViewSessions=1;SingleUser=0})}
+                }
+                [pscustomobject]@{Rows=@([pscustomobject]$row)}
+            }
+            { Invoke-EmptySqlAdministratorRecovery 'SELECT 1' } | Should -Throw '*empty instance*'
+        }
+        Should -Invoke Get-Service -Times 0
+        Should -Invoke Set-ItemProperty -Times 0
+    }
+    It 'does not infer an empty instance from a permission-filtered database/session inventory' {
+        Mock Get-SqlResult { [pscustomobject]@{Rows=@([pscustomobject]@{ViewDatabases=1;ViewOfflineDatabases=0;ViewSessions=0;SingleUser=0})} }
+        Mock Get-Service { throw 'No services may be touched.' }
+        { Invoke-EmptySqlAdministratorRecovery 'SELECT 1' } | Should -Throw '*complete normal-mode*'
+        Should -Invoke Get-Service -Times 0
+    }
+}
+
+Describe 'SQL restart and restoration lifecycle' {
+    BeforeEach {
+        $savedComputer = $env:COMPUTERNAME
+        $savedProgramData = $env:ProgramData
+        $env:COMPUTERNAME = 'UNIT-SQL-01'
+        $env:ProgramData = $TestDrive
+        $script:serviceEvents = [Collections.Generic.List[string]]::new()
+        function New-TestService($Name, $Status) {
+            $s = [pscustomobject]@{ ServiceName=$Name; Status=$Status; DependentServices=@() }
+            $s | Add-Member ScriptMethod Stop { $script:serviceEvents.Add("stop:$($this.ServiceName)"); $this.Status='Stopped' }
+            $s | Add-Member ScriptMethod Start { $script:serviceEvents.Add("start:$($this.ServiceName)"); $this.Status='Running' }
+            $s | Add-Member ScriptMethod WaitForStatus { param($Status,$Timeout); if($this.Status -ne [string]$Status){throw 'Test service did not reach requested state.'} }
+            $s | Add-Member ScriptMethod Refresh {}
+            $s
+        }
+        $script:testServer = New-TestService MSSQLSERVER Running
+        $script:testAgent = New-TestService SQLSERVERAGENT Running
+        $script:testBrowser = New-TestService SQLBrowser Stopped
+        Mock Get-Service {
+            switch ($Name) { 'MSSQLSERVER' {$script:testServer}; 'SQLSERVERAGENT' {$script:testAgent}; 'SQLBrowser' {$script:testBrowser} }
+        }
+        Mock Get-CimInstance { [pscustomobject]@{StartName='NT Service\MSSQLSERVER';StartMode='Disabled'} }
+        Mock Assert-EmptyIdleSqlInstance {}
+        Mock Set-PrivateDirectory { $null=New-Item -ItemType Directory -Path $Path -Force }
+        Mock Register-ScheduledTask { $script:serviceEvents.Add('watchdog') }
+        Mock Unregister-ScheduledTask { $script:serviceEvents.Add('disarm') }
+        Mock Start-Process {
+            $p=[pscustomobject]@{ExitCode=0}
+            $p | Add-Member ScriptMethod WaitForExit { param($Timeout); $true }
+            $p
+        }
+        Mock Get-SqlResult {
+            if($ApplicationName -eq 'SQLCMD' -and $Query -match 'CurrentRole'){
+                return [pscustomobject]@{Rows=@([pscustomobject]@{Major=16;Edition='Enterprise Edition';WindowsOnly=1;SingleUser=1;CurrentRole=1})}
+            }
+            [pscustomobject]@{Rows=@([pscustomobject]@{SingleUser=0;Probe=1})}
+        }
+        Mock Invoke-SqlNormalRestore {
+            $script:serviceEvents.Add('restore')
+            $script:testServer.Status='Running'; $script:testAgent.Status='Running'
+            Remove-Item -LiteralPath (Join-Path (Split-Path $Path) 'restore-required')
+            $true
+        }
+    }
+    AfterEach {
+        $env:COMPUTERNAME=$savedComputer
+        $env:ProgramData=$savedProgramData
+    }
+    It 'arms restoration before disruption and restores normal mode even when the grant fails' {
+        Mock Get-SqlResult { throw 'Simulated grant failure' } -ParameterFilter { $ApplicationName -eq 'SQLCMD' -and $Query -notmatch 'CurrentRole' }
+        { Invoke-EmptySqlAdministratorRecovery 'SELECT 1' } | Should -Throw '*grant failure*'
+        ($script:serviceEvents -join ',') | Should -Be 'watchdog,stop:SQLSERVERAGENT,stop:MSSQLSERVER,restore,disarm'
+        Should -Invoke Invoke-SqlNormalRestore -Times 1
+        Should -Invoke Start-Process -Times 1 -ParameterFilter { $ArgumentList -eq 'start MSSQLSERVER /mSQLCMD' }
+    }
+    It 'retains the protected marker and watchdog when restoration fails' {
+        Mock Invoke-SqlNormalRestore { $false }
+        { Invoke-EmptySqlAdministratorRecovery 'SELECT 1' } | Should -Throw '*watchdog retained*'
+        @(Get-ChildItem -LiteralPath $TestDrive -Recurse -Filter restore-required).Count | Should -BeGreaterThan 0
+        Should -Invoke Unregister-ScheduledTask -Times 0
+    }
+    It 'rearms the watchdog rather than disarming when normal-mode acceptance fails' {
+        Mock Get-SqlResult { [pscustomobject]@{Rows=@([pscustomobject]@{SingleUser=1})} }
+        { Invoke-EmptySqlAdministratorRecovery 'SELECT 1' } | Should -Throw '*watchdog retained*'
+        Should -Invoke Unregister-ScheduledTask -Times 0
+        @(Get-ChildItem -LiteralPath $TestDrive -Recurse -Filter restore-required).Count | Should -BeGreaterThan 0
+    }
+    It 'refuses unexpected dependent services before any SQL listener registry mutation' {
+        $script:testServer.DependentServices=@(New-TestService CustomerService Running)
+        Mock Set-ItemProperty { throw 'No mutation allowed.' }
+        { Set-MarketplaceSqlClientAccess ([pscustomobject]@{allowedCidrs=@('192.0.2.0/24')}) } | Should -Throw '*dependent service*'
+        Should -Invoke Set-ItemProperty -Times 0
+    }
+    It 'checks disposable image metadata before disruption and verifies single-user authority before grants' {
+        Mock Assert-DisposableSqlRecoveryImage {}
+        Invoke-EmptySqlAdministratorRecovery 'GRANT-UNIT-TEST' -Disposable
+        Should -Invoke Assert-DisposableSqlRecoveryImage -Times 1
+        Should -Invoke Assert-EmptyIdleSqlInstance -Times 0
+        Should -Invoke Get-SqlResult -Times 1 -ParameterFilter {$ApplicationName -eq 'SQLCMD' -and $Query -match 'CurrentRole'}
+        Should -Invoke Get-SqlResult -Times 1 -ParameterFilter {$ApplicationName -eq 'SQLCMD' -and $Query -eq 'GRANT-UNIT-TEST'}
+    }
+    It 'restores rather than granting when single-user edition or administrator authority is wrong' {
+        Mock Get-SqlResult {[pscustomobject]@{Rows=@([pscustomobject]@{Major=16;Edition='Evaluation Edition';WindowsOnly=1;SingleUser=1;CurrentRole=0})}} -ParameterFilter {$ApplicationName -eq 'SQLCMD'}
+        {Invoke-EmptySqlAdministratorRecovery 'GRANT-UNIT-TEST'} | Should -Throw '*no grants*'
+        Should -Invoke Get-SqlResult -Times 0 -ParameterFilter {$Query -eq 'GRANT-UNIT-TEST'}
+        Should -Invoke Invoke-SqlNormalRestore -Times 1
+    }
+    It 'preserves either prior SQL Agent state during a listener restart' -ForEach @(@{AgentState='Running'},@{AgentState='Stopped'}) {
+        $script:testAgent.Status=$AgentState
+        Mock Get-ItemProperty { [pscustomobject]@{Enabled=0;ListenOnAllIPs=0} }
+        Mock Get-ChildItem { @() }
+        Mock Set-ItemProperty {}
+        Mock Set-Service {}
+        Mock Set-WorkloadFirewall {}
+        Set-MarketplaceSqlClientAccess ([pscustomobject]@{allowedCidrs=@('192.0.2.0/24')})
+        $script:testAgent.Status | Should -Be $AgentState
+        $script:testServer.Status | Should -Be Running
+        $script:serviceEvents | Should -Contain 'start:MSSQLSERVER'
+        Should -Invoke Invoke-SqlNormalRestore -Times 0
+    }
+    It 'accepts an already-configured listener without disrupting a busy/nonempty instance' {
+        Mock Get-ItemProperty {[pscustomobject]@{Enabled=1;ListenOnAllIPs=1}} -ParameterFilter {$Path -like '*\Tcp'}
+        Mock Get-ItemProperty {[pscustomobject]@{Enabled=0}} -ParameterFilter {$Path -like '*\Np'}
+        Mock Get-ChildItem {@()}
+        Mock Set-WorkloadFirewall {}
+        Mock Assert-EmptyIdleSqlInstance {throw 'Busy instance may not be restarted.'}
+        Set-MarketplaceSqlClientAccess ([pscustomobject]@{allowedCidrs=@('192.0.2.0/24')})
+        Should -Invoke Assert-EmptyIdleSqlInstance -Times 0
+        $script:serviceEvents.Count | Should -Be 0
+    }
+    It 'rejects a required listener change before registry mutation when the instance is not empty/idle' {
+        Mock Get-ItemProperty {[pscustomobject]@{Enabled=0;ListenOnAllIPs=0}}
+        Mock Get-ChildItem {@()}
+        Mock Set-ItemProperty {throw 'No registry mutation permitted.'}
+        Mock Assert-EmptyIdleSqlInstance {throw 'Instance is not empty or idle.'}
+        {Set-MarketplaceSqlClientAccess ([pscustomobject]@{allowedCidrs=@('192.0.2.0/24')})} | Should -Throw '*not empty*'
+        Should -Invoke Set-ItemProperty -Times 0
+        $script:serviceEvents.Count | Should -Be 0
+    }
+
+    Describe 'Disposable SQL recovery metadata guard' {
+        It 'rejects other editions, versions, authentication modes and persisted single-user flags before service operations' {
+            Mock Get-Service {throw 'No service operation allowed.'}
+            foreach($bad in @('edition','version','mode','startup')){
+                Mock Get-ItemProperty {
+                    if($LiteralPath -like '*\Setup'){return [pscustomobject]@{Version=$(if($bad -eq 'version'){'15.0'}else{'16.0'});Edition=$(if($bad -eq 'edition'){'Developer Edition'}else{'Enterprise Edition'})}}
+                    if($LiteralPath -like '*\Parameters'){return [pscustomobject]@{SQLArg0=$(if($bad -eq 'startup'){'-mSQLCMD'}else{'-dC:\Sql\master.mdf'})}}
+                    [pscustomobject]@{LoginMode=$(if($bad -eq 'mode'){2}else{1})}
+                }
+                {Invoke-EmptySqlAdministratorRecovery 'GRANT-UNIT-TEST' -Disposable} | Should -Throw '*declared SQL 2022*'
+            }
+            Should -Invoke Get-Service -Times 0
+        }
+    }
+}
+
+Describe 'Convergence guest configuration contract' {
+    It 'accepts typed pending-restart opt-in but rejects string truthiness' {
+        $c = New-Config
+        $c.windowsPreparation = @{scopeInheritedFirewall=$false;restartIfRequired=$true}
+        (Read-WorkloadConfiguration (New-Payload $c)).windowsPreparation.restartIfRequired | Should -BeTrue
+        $c.windowsPreparation.restartIfRequired = 'true'
+        { Read-WorkloadConfiguration (New-Payload $c) } | Should -Throw '*boolean*'
+    }
+    It 'rejects Marketplace-only policies on ISO and requires explicit administrator policy for client access' {
+        $c = New-SqlConfig
+        $c.sqlServer.administratorPolicy = 'recoverEmptyInstance'
+        { Read-WorkloadConfiguration (New-Payload $c) } | Should -Throw '*Marketplace policy*'
+        $c.sqlServer.Remove('installerUrl'); $c.sqlServer.Remove('installerSha256')
+        $c.sqlServer.installationMode='marketplace'
+        $c.sqlServer.edition='Enterprise'; $c.sqlServer.productionLicenseConfirmed=$true
+        $c.sqlServer.clientAccess=$true
+        $c.sqlServer.Remove('administratorPolicy')
+        { Read-WorkloadConfiguration (New-Payload $c) } | Should -Throw '*administratorPolicy*'
+        $c.sqlServer.administratorPolicy='grantIfAuthorized'
+        (Read-WorkloadConfiguration (New-Payload $c)).sqlServer.clientAccess | Should -BeTrue
+    }
+}
+
 Describe 'IIS site safety' {
     BeforeEach {
         $sites = @([pscustomobject]@{ Name = 'Default Web Site'; physicalPath = '%SystemDrive%\inetpub\wwwroot' })

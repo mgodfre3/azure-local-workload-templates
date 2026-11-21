@@ -91,6 +91,7 @@ function Read-WorkloadAnswers {
     $answers = $json | ConvertFrom-Json -AsHashtable
     Assert-Answers $answers
     $answers.workloads = @(Expand-Workloads $answers.workloads $answers['namingPrefix'])
+    Assert-ConvergenceAnswers $answers
     $answers
 }
 
@@ -298,12 +299,13 @@ function Close-ArmConnection {
 }
 
 function Get-ArmToken {
+    param([ValidateSet('https://management.azure.com/', 'https://api.loganalytics.io')][string]$ResourceUrl = 'https://management.azure.com/')
     if ($script:Authentication -eq 'AzureCli') {
-        return Invoke-AzJson @('account', 'get-access-token', '--subscription', $script:Subscription, '--resource', "$script:Arm/")
+        return Invoke-AzJson @('account', 'get-access-token', '--subscription', $script:Subscription, '--resource', $ResourceUrl)
     }
     $result = $null
     try {
-        $result = Get-AzAccessToken -ResourceUrl "$script:Arm/" -TenantId $script:AzContext.Tenant.Id -DefaultProfile $script:AzContext -ErrorAction Stop
+        $result = Get-AzAccessToken -ResourceUrl $ResourceUrl -TenantId $script:AzContext.Tenant.Id -DefaultProfile $script:AzContext -ErrorAction Stop
         if ($result.Token -isnot [Security.SecureString] -or !$result.Token.Length) { throw 'Expected a protected ARM token.' }
         @{
             accessToken = [Net.NetworkCredential]::new('', $result.Token).Password
@@ -498,6 +500,8 @@ function Get-ConfigurationHash {
     }
     if ($Workload.profile -eq 'sqlServer' -and $Workload.sqlServer['installationMode'] -eq 'marketplace') {
         $value.sqlInstallationMode = 'marketplace'
+        if ($Workload.sqlServer['administratorPolicy']) { $value.sqlAdministratorManaged = $true }
+        if ($Workload.sqlServer['clientAccess'] -eq $true) { $value.sqlClientAccess = $true }
     }
     if ($Workload.ContainsKey('dataDisks')) {
         $value.dataDisks = @(Get-WorkloadDisks $Workload | ForEach-Object { [ordered]@{ role = $_.role; sizeGB = $_.sizeGB } })
@@ -789,10 +793,7 @@ function Get-GuestSettings {
         }
         return @{ script = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($scriptText -replace "`r`n", "`n"))) }
     }
-    $config.dataDiskSizeGB = $Workload.dataDiskSizeGB
-    if ($Workload.ContainsKey('windowsPreparation')) { $config.windowsPreparation = $Workload.windowsPreparation }
-    if ($Workload.profile -in @('fileServer', 'sqlServer')) { $config[$Workload.profile] = $Workload[$Workload.profile] }
-    $encodedConfig = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($config | ConvertTo-Json -Depth 10 -Compress)))
+    $encodedConfig = Get-WindowsConfigurationPayload $Answers $Workload
     $artifact = Get-WindowsGuestArtifact
     $bootstrap = "`$ErrorActionPreference='Stop';if((Get-FileHash -LiteralPath '.\Configure-Windows.ps1' -Algorithm SHA256).Hash -ne '$($artifact.sha256)'){throw 'Guest script checksum mismatch'};& '.\Configure-Windows.ps1' -ConfigurationBase64 '$encodedConfig'"
     $command = "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command `"$bootstrap`""
@@ -948,14 +949,25 @@ function Start-WorkloadDeployment {
         Import-MissingImages $answers $plan $TimeoutSeconds
         $deploymentId = "/subscriptions/$($answers.subscriptionId)/resourceGroups/$($answers.resourceGroup)/providers/Microsoft.Resources/deployments/$($answers.deploymentName)"
         $body = @{ properties = @{ mode = 'Incremental'; template = $template; parameters = $parameters } }
+        if ($answers.ContainsKey('convergence')) {
+            $parameters.configureServices = @{ value = $false }
+            $parameters.deployMonitoring = @{ value = $false }
+        }
         $null = Invoke-ArmRequest -Method PUT -Path "${deploymentId}?api-version=2022-09-01" -Body $body
-        $null = Wait-ArmResource $deploymentId '2022-09-01' $TimeoutSeconds
-        Write-Output "Deployment succeeded: $($answers.deploymentName). Requested VM/extensions/monitoring provisioning completed; base profiles do not install applications. Verify remote client access and workspace ingestion separately."
+        if ($answers.ContainsKey('convergence')) {
+            Invoke-FleetConvergence $answers $resolved $deploymentId $body $TimeoutSeconds
+            Write-Output "Fleet acceptance succeeded: $($answers.deploymentName). Guest/services, authenticated peer access, and selected-workspace resource-scoped Heartbeat plus unique log markers passed. Inherited monitoring destinations remain unchanged."
+        } else {
+            $null = Wait-ArmResource $deploymentId '2022-09-01' $TimeoutSeconds
+            Write-Output "Deployment succeeded: $($answers.deploymentName). Requested VM/extensions/monitoring provisioning completed; base profiles do not install applications. Verify remote client access and workspace ingestion separately."
+        }
     } finally {
         $parameters = $null
         $body = $null
         Close-ArmConnection
     }
 }
+
+. (Join-Path $PSScriptRoot 'WorkloadConvergence.ps1')
 
 Export-ModuleMember -Function Start-WorkloadDeployment, Read-WorkloadAnswers

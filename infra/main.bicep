@@ -12,6 +12,8 @@ param adminPassword string
 param workloads array
 param deploymentSet string
 param runId string
+param configureServices bool = true
+param deployMonitoring bool = true
 
 module workload 'modules/workload.bicep' = [for item in workloads: {
   name: '${deploymentSet}-${item.name}'
@@ -26,6 +28,8 @@ module workload 'modules/workload.bicep' = [for item in workloads: {
     workload: item
     deploymentSet: deploymentSet
     runId: runId
+    configureServices: configureServices
+    deployMonitoring: deployMonitoring
   }
 }]
 
