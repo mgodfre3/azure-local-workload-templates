@@ -88,6 +88,41 @@ Describe 'Opt-in fleet convergence' {
             $script:commandReads | Should -Be 2
             Should -Invoke Assert-OwnedResource -Times 1
         }
+        It 'waits for a newly submitted command to become readable without resubmitting it' {
+            $a = New-FleetFixture
+            $w = (New-ResolvedFixture $a)[0]
+            $script:commandReads = 0
+            Mock Assert-OwnedResource {}
+            Mock Start-Sleep {}
+            Mock Invoke-ArmRequest {}
+            Mock Get-ArmResource {
+                if ($Id -notmatch '/runCommands/') { return @{properties=@{status='Connected'}} }
+                $AllowNotFound | Should -BeTrue
+                $script:commandReads++
+                if ($script:commandReads -eq 1) { return $null }
+                @{properties=@{provisioningState='Succeeded';instanceView=@{
+                    executionState='Succeeded';exitCode=0;output='WORKLOADFLEET_RESULT={"accepted":true}'
+                }}}
+            }
+            (Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(5))).accepted | Should -BeTrue
+            $script:commandReads | Should -Be 2
+            Should -Invoke Invoke-ArmRequest -Times 1
+            Should -Invoke Start-Sleep -Times 1
+        }
+        It 'does not retry or resubmit a command when its read fails for a non-not-found error' {
+            $a = New-FleetFixture
+            $w = (New-ResolvedFixture $a)[0]
+            Mock Assert-OwnedResource {}
+            Mock Start-Sleep {}
+            Mock Invoke-ArmRequest {}
+            Mock Get-ArmResource {
+                if ($Id -notmatch '/runCommands/') { return @{properties=@{status='Connected'}} }
+                throw 'HTTP 403'
+            }
+            { Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(5)) } | Should -Throw '*HTTP 403*'
+            Should -Invoke Invoke-ArmRequest -Times 1
+            Should -Invoke Start-Sleep -Times 0
+        }
         It 'batches growing peer fleets while retaining every exact target and no extra VM' {
             $a=New-FleetFixture
             $a.workloads[0].allowedCidrs=@('192.0.2.0/24')

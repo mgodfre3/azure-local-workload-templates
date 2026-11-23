@@ -57,7 +57,12 @@ function Invoke-FleetGuestCommand {
     } }
     $null = Invoke-ArmRequest -Method PUT -Path "${commandId}?api-version=2024-07-10" -Body $request -CreateOnly
     do {
-        $result = Get-ArmResource $commandId '2024-07-10'
+        $result = Get-ArmResource $commandId '2024-07-10' -AllowNotFound
+        if (!$result) {
+            $null = Get-ConvergenceRemainingSeconds $Deadline
+            Start-Sleep -Seconds 10
+            continue
+        }
         $view = $result.properties['instanceView']
         if ($view -and $view['executionState'] -eq 'Succeeded' -and $view['exitCode'] -eq 0) {
             $lines = @(([string]$view['output'] -split '\r?\n') | Where-Object { $_.StartsWith('WORKLOADFLEET_RESULT=') })
