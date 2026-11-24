@@ -82,7 +82,7 @@ function Invoke-FleetGuestCommand {
 }
 
 function Get-CommittedFleetGuest {
-    param([ValidateSet('Configure-Windows.ps1', 'validate-linux.sh', 'Test-FleetClient.ps1')][string]$Name)
+    param([ValidateSet('Configure-Windows.ps1', 'validate-linux.sh', 'validate-cloud-init.py', 'Test-FleetClient.ps1')][string]$Name)
     $commit = Invoke-SourceGit @('rev-parse', 'HEAD')
     $path = Join-Path (Join-Path $script:Root 'guest') $Name
     $blob = Invoke-SourceGit @('rev-parse', "${commit}:guest/$Name")
@@ -176,11 +176,9 @@ function Invoke-FleetConvergence {
         $restarts[$workload.name] = 0
         $original = $Answers.workloads | Where-Object name -EQ $workload.name
         if ($workload.isLinux) {
-            $text = Get-CommittedFleetGuest 'validate-linux.sh'
-            $key = ($original.sshPublicKey -split ' ')[0..1] -join ' '
-            $text = $text.Replace('__ADMIN_USERNAME__', $Answers.adminUsername).
-                Replace('__SSH_KEY_BASE64__', [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($key))).
-                Replace('__UBUNTU_VERSION__', $(if ($original.image.os -eq 'Ubuntu2404') { '24.04' } else { '22.04' }))
+            $null = Get-CommittedFleetGuest 'validate-linux.sh'
+            $null = Get-CommittedFleetGuest 'validate-cloud-init.py'
+            $text = Get-LinuxAcceptanceScript $Answers $original
             $text += "`n" + 'printf ''WORKLOADFLEET_RESULT={"accepted":true}\n'''
             $acceptance = Invoke-FleetGuestCommand $Answers $workload $text $deadline
             if ($acceptance['accepted'] -isnot [bool] -or $acceptance.accepted -ne $true) { throw 'Linux readiness gate did not pass; no application/owned monitoring deployment followed.' }

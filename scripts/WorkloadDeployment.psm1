@@ -418,6 +418,25 @@ function Assert-NetworkConfiguration {
     }
 }
 
+function Get-LogicalNetworkDnsServers {
+    param([hashtable]$Network)
+    if (!$Network.properties['dhcpOptions'] -or !$Network.properties.dhcpOptions['dnsServers']) {
+        if (@($Network.properties.subnets | Where-Object { $_.properties.ipAllocationMethod -eq 'Static' }).Count) {
+            throw 'Static logical networks require explicit DNS servers; set them on the selected network before deployment. No DNS server is guessed.'
+        }
+        return
+    }
+    $servers = @($Network.properties.dhcpOptions.dnsServers)
+    foreach ($server in $servers) {
+        $number = ConvertTo-IPv4Number $server
+        if ($number -eq 0 -or $number -ge 3758096384 -or ($number -ge 2130706432 -and $number -le 2147483647)) {
+            throw 'Logical-network DNS must use unicast, non-loopback IPv4 addresses.'
+        }
+    }
+    if (@($servers | Select-Object -Unique).Count -ne $servers.Count) { throw 'Logical-network DNS server entries must be unique.' }
+    $servers
+}
+
 function Get-ImagePlan {
     param([hashtable]$Answers, [array]$Inventory)
     $plan = @()
@@ -502,6 +521,9 @@ function Get-ConfigurationHash {
         $value.sqlInstallationMode = 'marketplace'
         if ($Workload.sqlServer['administratorPolicy']) { $value.sqlAdministratorManaged = $true }
         if ($Workload.sqlServer['clientAccess'] -eq $true) { $value.sqlClientAccess = $true }
+    }
+    if ((Test-LinuxProfile $Workload) -and $Workload['linuxProvisioning'] -and $Workload.linuxProvisioning.schemaPolicy -ne 'strict') {
+        $value.linuxSchemaPolicy = $Workload.linuxProvisioning.schemaPolicy
     }
     if ($Workload.ContainsKey('dataDisks')) {
         $value.dataDisks = @(Get-WorkloadDisks $Workload | ForEach-Object { [ordered]@{ role = $_.role; sizeGB = $_.sizeGB } })
@@ -631,6 +653,8 @@ function Invoke-WorkloadPreflight {
         $inventory += @(Get-ArmCollection "/subscriptions/$($Answers.subscriptionId)/providers/Microsoft.AzureStackHCI/${type}?api-version=2024-01-01")
     }
     $plan = @(Get-ImagePlan $Answers $inventory)
+    $dnsServers = @(Get-LogicalNetworkDnsServers $network)
+    foreach ($item in $plan) { $item.dnsServers = $dnsServers }
     foreach ($workload in @($Answers.workloads | Where-Object { $_.image.source -eq 'marketplace' -and $_.image.publisher -eq 'microsoftsqlserver' })) {
         Assert-SqlMarketplaceCatalog $Answers $workload.image
     }
@@ -654,6 +678,11 @@ function Invoke-WorkloadPreflight {
         )) {
             $resource = Get-ArmResource "$rgId/providers/$($entry[0])" $entry[1] -AllowNotFound
             Assert-OwnedResource $resource $Answers.deploymentName $hash
+            if ($resource -and $entry[0] -like 'Microsoft.AzureStackHCI/networkInterfaces/*' -and
+                $resource.properties['dnsSettings'] -and $resource.properties.dnsSettings['dnsServers'] -and
+                (($resource.properties.dnsSettings.dnsServers -join ',') -cne ($dnsServers -join ','))) {
+                throw 'Existing managed NIC DNS differs from the selected logical network; review DNS drift before deployment.'
+            }
             if ($null -ne $resource -and $entry[0] -like 'Microsoft.HybridCompute/machines/*') {
                 $existingMachine = $resource
                 $vm = Get-ArmResource "$($resource.id)/providers/Microsoft.AzureStackHCI/virtualMachineInstances/default" -AllowNotFound
@@ -777,16 +806,26 @@ function Get-PreparedImagePath {
     finally { $token = $null; $fields = $null }
 }
 
+function Get-LinuxAcceptanceScript {
+    param([hashtable]$Answers, [hashtable]$Workload)
+    $text = Get-Content -LiteralPath (Join-Path $script:Root 'guest\validate-linux.sh') -Raw
+    $key = ($Workload.sshPublicKey -split ' ')[0..1] -join ' '
+    $policy = if ($Workload['linuxProvisioning']) { $Workload.linuxProvisioning.schemaPolicy } else { 'strict' }
+    if ($policy -notin @('strict', 'azureLocalKnownWarnings')) { throw 'Unknown Linux schema policy.' }
+    $helper = Get-Content -LiteralPath (Join-Path $script:Root 'guest\validate-cloud-init.py') -Raw
+    $text.Replace('__ADMIN_USERNAME__', $Answers.adminUsername).
+        Replace('__SSH_KEY_BASE64__', [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($key))).
+        Replace('__UBUNTU_VERSION__', $(if ($Workload.image.os -eq 'Ubuntu2404') { '24.04' } else { '22.04' })).
+        Replace('__SCHEMA_POLICY__', $policy).
+        Replace('__CLOUD_INIT_VALIDATOR_BASE64__', [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($helper -replace "`r`n", "`n"))))
+}
+
 function Get-GuestSettings {
     param([hashtable]$Answers, [hashtable]$Workload)
     if ($Workload.profile -eq 'windowsApp') { return @{} }
     $config = @{ profile = $Workload.profile; adminUsername = $Answers.adminUsername; allowedCidrs = $Workload.allowedCidrs }
     if (Test-LinuxProfile $Workload) {
-        $scriptText = Get-Content -LiteralPath (Join-Path $script:Root 'guest\validate-linux.sh') -Raw
-        $key = ($Workload.sshPublicKey -split ' ')[0..1] -join ' '
-        $scriptText = $scriptText.Replace('__ADMIN_USERNAME__', $Answers.adminUsername).
-            Replace('__SSH_KEY_BASE64__', [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($key))).
-            Replace('__UBUNTU_VERSION__', $(if ($Workload.image.os -eq 'Ubuntu2404') { '24.04' } else { '22.04' }))
+        $scriptText = Get-LinuxAcceptanceScript $Answers $Workload
         if ($Workload.profile -eq 'webServer') {
             $nginx = Get-Content -LiteralPath (Join-Path $script:Root 'guest\configure-nginx.sh') -Raw
             $scriptText += "`n" + $nginx.Replace('__ALLOWED_CIDRS__', ($Workload.allowedCidrs -join ' '))
@@ -929,6 +968,7 @@ function Start-WorkloadDeployment {
                 privateIpAddress = if ($workload.ContainsKey('privateIpAddress')) { $workload.privateIpAddress } else { '' }
                 sshPublicKey = if ($workload.ContainsKey('sshPublicKey')) { $workload.sshPublicKey } else { '' }
                 imageId = $image.imageId
+                dnsServers = @($image['dnsServers'] | Where-Object { $_ })
                 configurationHash = Get-ConfigurationHash $answers $workload $image.imageId
                 tags = $image.tags
                 guestSettings = Get-GuestSettings $answers $workload

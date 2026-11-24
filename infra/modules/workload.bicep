@@ -42,7 +42,11 @@ resource nic 'Microsoft.AzureStackHCI/networkInterfaces@2024-01-01' = {
     type: 'CustomLocation'
     name: customLocationId
   }
-  properties: {
+  properties: union(empty(workload.dnsServers) ? {} : {
+    dnsSettings: {
+      dnsServers: workload.dnsServers
+    }
+  }, {
     ipConfigurations: [
       {
         name: 'primary'
@@ -55,7 +59,7 @@ resource nic 'Microsoft.AzureStackHCI/networkInterfaces@2024-01-01' = {
         })
       }
     ]
-  }
+  })
 }
 
 resource dataDisk 'Microsoft.AzureStackHCI/virtualHardDisks@2024-01-01' = [for disk in workload.dataDisks: {

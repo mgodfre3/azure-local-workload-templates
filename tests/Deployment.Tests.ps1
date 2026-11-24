@@ -102,6 +102,25 @@ Describe 'Answer contract and pure validation' {
             { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
         }
 
+        It 'requires an explicit known-warning policy on Linux only and hashes that choice' {
+            $a = New-LinuxAnswers
+            $path = Join-Path $TestDrive 'linux-policy.json'
+            $hash = Get-ConfigurationHash $a $a.workloads[0] '/images/fixture'
+            $a.workloads[0].linuxProvisioning = @{ schemaPolicy = 'strict' }
+            (Get-ConfigurationHash $a $a.workloads[0] '/images/fixture') | Should -Be $hash
+            $a.workloads[0].linuxProvisioning.schemaPolicy = 'azureLocalKnownWarnings'
+            Write-Answers $a $path
+            (Read-WorkloadAnswers $path).workloads[0].linuxProvisioning.schemaPolicy | Should -Be 'azureLocalKnownWarnings'
+            (Get-ConfigurationHash $a $a.workloads[0] '/images/fixture') | Should -Not -Be $hash
+            $a.workloads[0].linuxProvisioning.schemaPolicy = 'ignore'
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+            $a = New-Answers
+            $a.workloads[0].linuxProvisioning = @{ schemaPolicy = 'strict' }
+            Write-Answers $a $path
+            { Read-WorkloadAnswers $path } | Should -Throw '*schema*'
+        }
+
         It 'accepts explicit existing Windows 2022 and 2025 images for every Windows profile' {
             $path = Join-Path $TestDrive 'windows-existing.json'
             foreach ($profile in @('fileServer', 'sqlServer', 'iisServer', 'windowsApp')) {
@@ -909,6 +928,19 @@ Describe 'Static addressing, RBAC and bounded polling' {
             { Assert-NetworkConfiguration $script:networkFixture @($workload) } | Should -Not -Throw
         }
 
+        It 'copies exact logical-network DNS order and rejects missing static or unsafe resolver inputs' {
+            { Get-LogicalNetworkDnsServers $script:networkFixture } | Should -Throw '*explicit DNS*'
+            $script:networkFixture.properties.dhcpOptions = @{ dnsServers = @('192.0.2.53', '192.0.2.54') }
+            (@(Get-LogicalNetworkDnsServers $script:networkFixture) -join ',') | Should -Be '192.0.2.53,192.0.2.54'
+            foreach($unsafe in @('127.0.0.1','0.0.0.0','224.0.0.1','bad')){
+                $script:networkFixture.properties.dhcpOptions.dnsServers = @($unsafe)
+                { Get-LogicalNetworkDnsServers $script:networkFixture } | Should -Throw
+            }
+            $script:networkFixture.properties.Remove('dhcpOptions')
+            $script:networkFixture.properties.subnets[0].properties.ipAllocationMethod = 'Dynamic'
+            @(Get-LogicalNetworkDnsServers $script:networkFixture).Count | Should -Be 0
+        }
+
         It 'requires a static address on every expanded instance, and permits DHCP without lists' {
             $w = (New-Answers).workloads[0]
             $w.name = 'files'; $w.count = 2
@@ -957,7 +989,7 @@ Describe 'Static addressing, RBAC and bounded polling' {
                 @{
                     name = 'fixture'; location = $region
                     extendedLocation = @{ name = $script:preflightAnswers.stamp.customLocationId }
-                    properties = @{ provisioningState = 'Succeeded'; connectivityStatus = 'Connected' }
+                    properties = @{ provisioningState = 'Succeeded'; connectivityStatus = 'Connected'; subnets = @() }
                 }
             }
             { Invoke-WorkloadPreflight $script:preflightAnswers } | Should -Not -Throw

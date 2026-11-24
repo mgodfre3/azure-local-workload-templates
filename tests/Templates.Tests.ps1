@@ -23,6 +23,12 @@ Describe 'Compiled ARM deployment contract' {
         ($template.outputs | ConvertTo-Json -Depth 10) | Should -Not -Match 'Password|guestSettings'
     }
 
+    It 'passes validated logical-network DNS explicitly to the workload NIC' {
+        $nic = @($workload.resources | Where-Object type -EQ 'Microsoft.AzureStackHCI/networkInterfaces')[0]
+        $nic.properties | Should -Match 'union\(if\(empty\(.*dnsServers'
+        $nic.properties | Should -Match 'dnsSettings.*dnsServers.*workload.*dnsServers'
+    }
+
     It 'enables guest management and a system-assigned Arc identity' {
         $machine = @($workload.resources | Where-Object type -EQ 'Microsoft.HybridCompute/machines')[0]
         $machine.kind | Should -Be HCI

@@ -6,7 +6,7 @@ These editable values are small-lab/initial-pilot starting points, not productio
 | --- | --- | --- | --- | --- | --- | --- |
 | `fileServer` | 1 | 2 | 4096 | 128 | 128 `data`: shares on `E:` | Standalone encrypted SMB share; client-scoped TCP 445 |
 | `sqlServer` | 0 (enable 1 when licensing/source are ready) | 4 | 8192 | 128 | ISO: 128 `data`, SQL under `E:\Sql`; Marketplace: disk stays RAW, image database paths preserved | SQL 2022 ISO Developer/Evaluation or licensed Standard/Enterprise; alternatively verify preinstalled Enterprise without SQL/firewall changes |
-| `webServer` | 0 (enable 1 for a pilot) | 2 | 2048 | 64 | None; demonstration content on OS disk | Ubuntu 22.04/24.04 Nginx HTTP site with HTTP-layer client CIDR ACL |
+| `webServer` | 0 (enable 1 for a pilot) | 2 | 2048 | 64 | None; demonstration content on OS disk | Ubuntu 24.04 (primary)/22.04 Nginx HTTP site with HTTP-layer client CIDR ACL |
 | `iisServer` | 0 (enable 1 for a pilot) | 2 | 4096 | 128 | 64 `data`: site content at `E:\Iis` | Windows IIS static HTTP site; client-scoped TCP 80 |
 | `windowsApp` | 0 (enable 1 for a pilot) | 2 | 4096 | 128 | 64 `appdata`, **unformatted** | Base Windows VM only; no application/runtime or service firewall rule |
 | `linuxApp` | 0 (enable 1 for a pilot) | 2 | 2048 | 64 | 64 `appdata` + 32 `logs`, **unformatted** | Base Ubuntu VM only; no application/database or service firewall rule |
@@ -44,7 +44,7 @@ The Nginx example uses a prepared image already on the stamp's CSV; the base-Lin
 }
 ```
 
-Use `Ubuntu2404` for a prepared 24.04 image; both Linux profiles enforce the selected version at guest acceptance. Base Linux runs a validation-only extension, without installing an application or formatting its data disks. An unknown-provenance existing image is limited to the explicit one-per-profile pilot option documented in the deployment guide; it is not silently attested as prepared.
+Use primary `Ubuntu2404` for a prepared 24.04 image; `Ubuntu2204` remains explicit. Both Linux profiles enforce the selected version at guest acceptance. Strict cloud-init validation is the default; the investigated provider-warning policy requires an explicit `linuxProvisioning.schemaPolicy: azureLocalKnownWarnings` selection and never changes the original seed. NIC DNS is copied from the selected logical network, not guessed or changed on shared infrastructure. Base Linux runs a validation-only extension, without installing an application or formatting its data disks. An unknown-provenance existing image is limited to the explicit one-per-profile pilot option documented in the deployment guide; it is not silently attested as prepared.
 
 This is an Azure Local gallery resource ID, not a filename. See the [deployment guide's preparation and secret-handling requirements](../README.md#prepare-images). The importer trusts the operator-verified digest for provenance/reuse; it does not rehash bytes on the stamp. Never put a SAS, password, private key or customer-specific identifiers in a committed answer file.
 

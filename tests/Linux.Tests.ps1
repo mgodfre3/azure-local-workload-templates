@@ -7,7 +7,8 @@ BeforeAll {
             [string]$Version = '24.04', [string]$ExpectedVersion = '24.04',
             [int]$CloudExit = 0, [int]$SchemaExit = 0, [string]$CloudId = 'nocloud',
             [switch]$WrongKey, [switch]$InheritedKey, [switch]$PasswordEnabled,
-            [switch]$SocketOnly, [switch]$SshInactive, [switch]$StartFailure, [switch]$UnlockedPassword
+            [switch]$SocketOnly, [switch]$SshInactive, [switch]$StartFailure, [switch]$UnlockedPassword,
+            [switch]$RootLogin, [switch]$DnsFailure
         )
         $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
         $etc = Join-Path $root 'etc'
@@ -24,9 +25,9 @@ id() { echo 0; }
 cloud-init() { if [ "$1" = schema ]; then return __SCHEMA_EXIT__; fi; return __CLOUD_EXIT__; }
 cloud-id() { echo '__CLOUD_ID__'; }
 timeout() { shift; "$@"; }
-getent() { echo 'vmadmin:x:1000:1000::__ROOT__/home/vmadmin:/bin/bash'; }
+getent() { if [ "$1" = ahostsv4 ]; then return __DNS_EXIT__; fi; echo 'vmadmin:x:1000:1000::__ROOT__/home/vmadmin:/bin/bash'; }
 passwd() { echo "$2 __ACCOUNT_LOCK__"; }
-sshd() { printf 'passwordauthentication __PASSWORD__\nkbdinteractiveauthentication no\n'; }
+sshd() { printf 'passwordauthentication __PASSWORD__\nkbdinteractiveauthentication no\npermitrootlogin __ROOT_LOGIN__\n'; }
 ssh_active=__SSH_ACTIVE__
 systemctl() {
     case "$1:${3-}" in
@@ -41,7 +42,9 @@ systemctl() {
             Replace('__SSH_ACTIVE__', $(if ($SocketOnly -or $SshInactive) { '1' } else { '0' })).
             Replace('__SOCKET_EXIT__', $(if ($SshInactive) { '1' } else { '0' })).
             Replace('__START_EXIT__', $(if ($StartFailure) { '1' } else { '0' })).
-            Replace('__ACCOUNT_LOCK__', $(if ($UnlockedPassword) { 'P' } else { 'L' }))
+            Replace('__ACCOUNT_LOCK__', $(if ($UnlockedPassword) { 'P' } else { 'L' })).
+            Replace('__ROOT_LOGIN__', $(if ($RootLogin) { 'yes' } else { 'no' })).
+            Replace('__DNS_EXIT__', $(if ($DnsFailure) { '1' } else { '0' }))
         $body = $validator.Replace('/etc/', "$unixRoot/etc/").Replace('/home/', "$unixRoot/home/").
             Replace('/root/', "$unixRoot/root/").Replace('/usr/sbin/sshd', 'sshd').
             Replace('__ADMIN_USERNAME__', 'vmadmin').Replace('__UBUNTU_VERSION__', $ExpectedVersion).
@@ -76,6 +79,8 @@ Describe 'Linux guest acceptance (isolated Bash fixtures)' {
         (Invoke-LinuxAcceptance -WrongKey).Output | Should -Match 'SSH keys differ'
         (Invoke-LinuxAcceptance -InheritedKey).Output | Should -Match 'inherited SSH login keys'
         (Invoke-LinuxAcceptance -PasswordEnabled).Output | Should -Match 'password authentication is enabled'
+        (Invoke-LinuxAcceptance -RootLogin).Output | Should -Match 'root login is enabled'
+        (Invoke-LinuxAcceptance -DnsFailure).Output | Should -Match 'DNS resolution failed'
     }
     It 'supports an already listening SSH socket without enabling a closed endpoint or ignoring startup failure' {
         $result = Invoke-LinuxAcceptance -SocketOnly

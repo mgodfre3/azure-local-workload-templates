@@ -5,10 +5,21 @@ fail() { echo "Linux image acceptance failed: $1" >&2; exit 1; }
 . /etc/os-release
 [ "$ID" = ubuntu ] && [ "$VERSION_ID" = '__UBUNTU_VERSION__' ] || fail "unexpected Ubuntu release"
 command -v cloud-init >/dev/null || fail "cloud-init is missing"
-timeout 180 cloud-init status --wait >/dev/null 2>&1 || fail "cloud-init did not finish cleanly"
+cloud_status=0
+timeout 180 cloud-init status --wait >/dev/null 2>&1 || cloud_status=$?
 [ "$(cloud-id)" = nocloud ] || fail "NoCloud onboarding was not observed"
-timeout 30 cloud-init schema --config-file /var/lib/cloud/instance/user-data.txt >/dev/null 2>&1 ||
-    fail "generated cloud-init user data schema is invalid"
+case '__SCHEMA_POLICY__' in
+    azureLocalKnownWarnings)
+        [ "$cloud_status" = 0 ] || [ "$cloud_status" = 2 ] || fail "cloud-init did not finish"
+        timeout 30 python3 -c "import base64; exec(compile(base64.b64decode('__CLOUD_INIT_VALIDATOR_BASE64__'), 'validate-cloud-init.py', 'exec'))" ||
+            fail "original provisioning evidence does not match the explicit known-warning policy"
+        ;;
+    *)
+        [ "$cloud_status" = 0 ] || fail "cloud-init did not finish cleanly"
+        timeout 30 cloud-init schema --config-file /var/lib/cloud/instance/user-data.txt >/dev/null 2>&1 ||
+            fail "generated cloud-init user data schema is invalid"
+        ;;
+esac
 user='__ADMIN_USERNAME__'
 home=$(getent passwd "$user" | cut -d: -f6)
 [ "$home" = "/home/$user" ] || fail "unexpected administrator home"
@@ -32,6 +43,8 @@ fi
 sshd_config=$(/usr/sbin/sshd -T -C "user=$user,host=localhost,addr=127.0.0.1") || fail "effective SSH configuration could not be validated"
 printf '%s\n' "$sshd_config" | grep -qx 'passwordauthentication no' || fail "SSH password authentication is enabled"
 printf '%s\n' "$sshd_config" | grep -qx 'kbdinteractiveauthentication no' || fail "SSH interactive authentication is enabled"
+printf '%s\n' "$sshd_config" | grep -qx 'permitrootlogin no' || fail "SSH root login is enabled"
 [ -s /etc/machine-id ] || fail "machine identity is missing"
 systemctl is-active --quiet ssh || fail "SSH is not active"
+timeout 20 getent ahostsv4 aka.ms >/dev/null || fail "system DNS resolution failed"
 echo "Linux guest acceptance passed: expected Ubuntu, NoCloud/cloud-init, requested SSH key and password-disabled login. Source preparation provenance is not certified."
