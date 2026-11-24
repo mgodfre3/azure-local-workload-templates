@@ -338,6 +338,9 @@ function Set-InheritedFirewallScope([int]$Port, [string[]]$Cidrs) {
 
 function Set-FileServer($Config, $Admin) {
     $feature = Install-WindowsFeature FS-FileServer
+    Get-NetFirewallRule -PolicyStore PersistentStore |
+        Where-Object Name -eq 'FileServer-ServerManager-SMB-TCP-In' |
+        Disable-NetFirewallRule | Out-Null
     if (!$feature.Success) { throw 'File server role installation failed; no restart was requested.' }
     if ($feature.RestartNeeded -ne 'No') { throw 'A Windows restart is required. File server role installation completed.' }
     Assert-ScopedFirewall 445 $Config.allowedCidrs
@@ -630,13 +633,26 @@ DECLARE @name sysname, @q nvarchar(max);
 DECLARE names CURSOR LOCAL FAST_FORWARD FOR SELECT N'$escaped' UNION ALL SELECT N'$system';
 OPEN names; FETCH NEXT FROM names INTO @name;
 WHILE @@FETCH_STATUS=0 BEGIN
- IF SUSER_ID(@name) IS NULL BEGIN SET @q=N'CREATE LOGIN '+QUOTENAME(@name)+N' FROM WINDOWS'; EXEC(@q); END;
- IF IS_SRVROLEMEMBER(N'sysadmin',@name)<>1 BEGIN SET @q=N'ALTER SERVER ROLE sysadmin ADD MEMBER '+QUOTENAME(@name); EXEC(@q); END;
+ IF EXISTS(SELECT 1 FROM sys.server_principals WHERE name=@name AND (type<>'U' OR is_disabled<>0))
+  THROW 51000,'Intended Windows SQL login has an unexpected type or disabled state.',1;
+ IF NOT EXISTS(SELECT 1 FROM sys.server_principals WHERE name=@name)
+  BEGIN SET @q=N'CREATE LOGIN '+QUOTENAME(@name)+N' FROM WINDOWS'; EXEC(@q); END;
+ IF NOT EXISTS(SELECT 1 FROM sys.server_role_members m
+  JOIN sys.server_principals r ON r.principal_id=m.role_principal_id
+  JOIN sys.server_principals p ON p.principal_id=m.member_principal_id
+  WHERE r.name=N'sysadmin' AND p.name=@name)
+  BEGIN SET @q=N'ALTER SERVER ROLE sysadmin ADD MEMBER '+QUOTENAME(@name); EXEC(@q); END;
+ IF NOT EXISTS(SELECT 1 FROM sys.server_role_members m
+  JOIN sys.server_principals r ON r.principal_id=m.role_principal_id
+  JOIN sys.server_principals p ON p.principal_id=m.member_principal_id
+  WHERE r.name=N'sysadmin' AND p.name=@name AND p.type='U' AND p.is_disabled=0)
+  THROW 51001,'Persistent intended Windows SQL sysadmin membership was not verified.',1;
  FETCH NEXT FROM names INTO @name;
 END;
 CLOSE names; DEALLOCATE names;
 SELECT 1 AS Granted;
 "@
+    # Single-user Windows administrator authority is temporary, not a persisted role grant.
     if ($roles.CurrentRole -eq 1) {
         $null = Get-SqlResult $grant
     } else {

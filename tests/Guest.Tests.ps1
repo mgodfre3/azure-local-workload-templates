@@ -131,6 +131,63 @@ Describe 'Explicit Marketplace SQL administrator convergence' {
         {Set-MarketplaceSqlAdministrator $sql $admin} | Should -Throw '*unexpected SQL failure*'
         Should -Invoke Invoke-EmptySqlAdministratorRecovery -Times 0
     }
+    It 'does not mistake temporary single-user sysadmin authority for persistent Windows login membership' {
+        $sql.administratorPolicy = 'recoverDisposableInstance'
+        $script:systemRole = 0
+        Mock Invoke-EmptySqlAdministratorRecovery {
+            param($Grant)
+            $Grant | Should -Not -Match 'IF SUSER_ID|IF IS_SRVROLEMEMBER'
+            $Grant | Should -Match 'IF NOT EXISTS\(SELECT 1 FROM sys.server_principals WHERE name=@name\)'
+            $Grant | Should -Match 'sys.server_role_members m'
+            $Grant | Should -Match "p.type='U' AND p.is_disabled=0"
+            $Grant | Should -Match 'THROW 51001'
+            $script:granted = $true
+        }
+        Set-MarketplaceSqlAdministrator $sql $admin
+        Should -Invoke Invoke-EmptySqlAdministratorRecovery -Times 1 -Exactly -ParameterFilter { $Disposable }
+    }
+}
+
+Describe 'File server role-created firewall safety' {
+    BeforeAll {
+        function Install-WindowsFeature { param($Name) }
+        function Get-NetFirewallRule { param($PolicyStore) }
+        function Disable-NetFirewallRule { param([Parameter(ValueFromPipeline)]$InputObject) }
+    }
+    BeforeEach {
+        $script:roleRuleEnabled = $false
+        Mock Install-WindowsFeature {
+            $script:roleRuleEnabled = $true
+            [pscustomobject]@{ Success=$true; RestartNeeded='No' }
+        }
+        Mock Get-NetFirewallRule {
+            [pscustomobject]@{ Name='FileServer-ServerManager-SMB-TCP-In' }
+            [pscustomobject]@{ Name='unrelated-rule' }
+        }
+        Mock Disable-NetFirewallRule {
+            param($InputObject)
+            $InputObject.Name | Should -Be 'FileServer-ServerManager-SMB-TCP-In'
+            $script:roleRuleEnabled = $false
+        }
+        Mock Assert-ScopedFirewall {
+            if ($script:roleRuleEnabled) { throw 'Role-created SMB rule is still broad.' }
+        }
+        Mock Set-PrivateDirectory { throw 'Reached guarded share setup.' }
+    }
+    It 'closes the new broad role opening before effective-policy validation and share creation' {
+        { Set-FileServer (New-Config) $null } | Should -Throw '*Reached guarded share setup*'
+        Should -Invoke Disable-NetFirewallRule -Times 1 -Exactly
+        Should -Invoke Assert-ScopedFirewall -Times 1 -Exactly -ParameterFilter { $Port -eq 445 }
+    }
+    It 'closes the role opening even when installation requires a restart' {
+        Mock Install-WindowsFeature {
+            $script:roleRuleEnabled = $true
+            [pscustomobject]@{ Success=$true; RestartNeeded='Yes' }
+        }
+        { Set-FileServer (New-Config) $null } | Should -Throw '*Windows restart is required*'
+        $script:roleRuleEnabled | Should -BeFalse
+        Should -Invoke Set-PrivateDirectory -Times 0
+    }
 }
 
 Describe 'SQL disruptive recovery preconditions' {
