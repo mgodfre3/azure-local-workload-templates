@@ -50,12 +50,28 @@ function Invoke-FleetGuestCommand {
         $null = Get-ConvergenceRemainingSeconds $Deadline
         Start-Sleep -Seconds 10
     } while ($true)
-    $commandId = "$machineId/runCommands/wlf-$([guid]::NewGuid().ToString('N'))"
+    $commandId = "$machineId/runCommands/wlf-$($Workload.configurationHash.Substring(0, 24))"
+    $existing = Get-ArmResource $commandId '2024-07-10' -AllowNotFound
+    if ($existing) {
+        Assert-OwnedResource $existing $Answers.deploymentName $Workload.configurationHash
+        $existingView = $existing.properties['instanceView']
+        if (!$existingView -or $existingView['executionState'] -notin @('Succeeded', 'Failed', 'TimedOut', 'Canceled') -or
+            $existing.properties.provisioningState -notin @('Succeeded', 'Failed', 'Canceled', 'Cancelled')) {
+            throw 'Owned fleet command is still active; it was not overwritten. Inspect the prior invocation before retrying.'
+        }
+    }
+    $nonce = [guid]::NewGuid().ToString('N')
+    $marker = "WORKLOADFLEET_INVOCATION=$nonce"
+    $Script = ($Script -replace "`r`n", "`n").TrimEnd("`n") + "`n"
+    $sentinel = if ($Workload.isLinux) { "printf '$marker\n'`n" } else { "'$marker'`n" }
     $timeout = [Math]::Min(900, (Get-ConvergenceRemainingSeconds $Deadline))
-    $request = @{ location = $Answers.location; properties = @{
-        source = @{ script = (($Script -replace "`r`n", "`n").TrimEnd("`n") + "`n") }; timeoutInSeconds = $timeout; asyncExecution = $false
+    $request = @{ location = $Answers.location; tags = @{
+        project = 'azure-local-workload-templates'; deploymentSet = $Answers.deploymentName; configurationHash = $Workload.configurationHash
+    }; properties = @{
+        source = @{ script = $sentinel + $Script + $sentinel }; timeoutInSeconds = $timeout
+        asyncExecution = $false; forceUpdateTag = $nonce
     } }
-    $null = Invoke-ArmRequest -Method PUT -Path "${commandId}?api-version=2024-07-10" -Body $request -CreateOnly
+    $null = Invoke-ArmRequest -Method PUT -Path "${commandId}?api-version=2024-07-10" -Body $request -CreateOnly:(!$existing)
     do {
         $result = Get-ArmResource $commandId '2024-07-10' -AllowNotFound
         if (!$result) {
@@ -64,14 +80,16 @@ function Invoke-FleetGuestCommand {
             continue
         }
         $view = $result.properties['instanceView']
-        if ($view -and $view['executionState'] -eq 'Succeeded' -and $view['exitCode'] -eq 0) {
+        $fresh = $view -and ([string]$view['output']).Contains($marker)
+        if ($fresh -and $view['executionState'] -eq 'Succeeded' -and $view['exitCode'] -eq 0) {
             $lines = @(([string]$view['output'] -split '\r?\n') | Where-Object { $_.StartsWith('WORKLOADFLEET_RESULT=') })
             if ($lines.Count -ne 1) { throw 'Guest command completed without one verifiable result; stdout/stderr are not echoed.' }
             try { return $lines[0].Substring('WORKLOADFLEET_RESULT='.Length) | ConvertFrom-Json -AsHashtable }
             catch { throw 'Guest command returned invalid structured evidence; raw output is suppressed.' }
         }
-        if ($result.properties.provisioningState -in @('Failed', 'Canceled', 'Cancelled') -or
-            ($view -and $view['executionState'] -in @('Failed', 'TimedOut', 'Canceled'))) {
+        if (($result.properties.provisioningState -in @('Failed', 'Canceled', 'Cancelled') -and
+                $result.properties['forceUpdateTag'] -eq $nonce) -or
+            ($fresh -and $view['executionState'] -in @('Failed', 'TimedOut', 'Canceled'))) {
             $failure = [InvalidOperationException]::new("Fleet guest acceptance failed on '$($Workload.name)'. Inspect its protected Run Command status; output and credentials are not echoed.")
             $failure.Data['RunCommandExecutionFailure'] = $true
             throw $failure

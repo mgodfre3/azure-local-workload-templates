@@ -71,19 +71,23 @@ Describe 'Opt-in fleet convergence' {
             $a = New-FleetFixture
             $w = (New-ResolvedFixture $a)[0]
             $script:commandReads=0
+            $script:commandSubmitted=$false
             Mock Assert-OwnedResource {}
             Mock Start-Sleep {}
             Mock Invoke-ArmRequest {
+                $script:commandSubmitted=$true
+                $script:commandNonce=$Body.properties.forceUpdateTag
                 (($Path -split '/runCommands/')[1] -split '\?')[0].Length | Should -BeLessOrEqual 36
                 $Body.properties.source.script | Should -Not -Match "`r"
                 $Body.properties.source.script.EndsWith("`n") | Should -BeTrue
             }
             Mock Get-ArmResource {
                 if ($Id -notmatch '/runCommands/') { return @{properties=@{status='Connected'}} }
+                if (!$script:commandSubmitted) { return $null }
                 $script:commandReads++
                 @{properties=@{provisioningState='Succeeded';instanceView=@{
                     executionState=$(if($script:commandReads -eq 1){'Running'}else{'Succeeded'})
-                    exitCode=0;output='WORKLOADFLEET_RESULT={"accepted":true}'
+                    exitCode=0;output="WORKLOADFLEET_INVOCATION=$script:commandNonce`n"+'WORKLOADFLEET_RESULT={"accepted":true}'
                 }}}
             }
             (Invoke-FleetGuestCommand $a $w "NO LIVE`r`nEXECUTION" ([DateTime]::UtcNow.AddMinutes(5))).accepted | Should -BeTrue
@@ -94,16 +98,18 @@ Describe 'Opt-in fleet convergence' {
             $a = New-FleetFixture
             $w = (New-ResolvedFixture $a)[0]
             $script:commandReads = 0
+            $script:commandSubmitted=$false
             Mock Assert-OwnedResource {}
             Mock Start-Sleep {}
-            Mock Invoke-ArmRequest {}
+            Mock Invoke-ArmRequest { $script:commandSubmitted=$true; $script:commandNonce=$Body.properties.forceUpdateTag }
             Mock Get-ArmResource {
                 if ($Id -notmatch '/runCommands/') { return @{properties=@{status='Connected'}} }
+                if (!$script:commandSubmitted) { return $null }
                 $AllowNotFound | Should -BeTrue
                 $script:commandReads++
                 if ($script:commandReads -eq 1) { return $null }
                 @{properties=@{provisioningState='Succeeded';instanceView=@{
-                    executionState='Succeeded';exitCode=0;output='WORKLOADFLEET_RESULT={"accepted":true}'
+                    executionState='Succeeded';exitCode=0;output="WORKLOADFLEET_INVOCATION=$script:commandNonce`n"+'WORKLOADFLEET_RESULT={"accepted":true}'
                 }}}
             }
             (Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(5))).accepted | Should -BeTrue
@@ -122,8 +128,49 @@ Describe 'Opt-in fleet convergence' {
                 throw 'HTTP 403'
             }
             { Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(5)) } | Should -Throw '*HTTP 403*'
-            Should -Invoke Invoke-ArmRequest -Times 1
+            Should -Invoke Invoke-ArmRequest -Times 0
             Should -Invoke Start-Sleep -Times 0
+        }
+        It 'reuses only a completed owned command and ignores stale success until the fresh nonce appears' {
+            $a=New-FleetFixture
+            $w=(New-ResolvedFixture $a)[0]
+            $script:slotReads=0
+            $script:slotNonce='previous'
+            Mock Assert-OwnedResource {}
+            Mock Start-Sleep {}
+            Mock Invoke-ArmRequest {
+                $CreateOnly | Should -BeFalse
+                $Path | Should -Match "/runCommands/wlf-$('a' * 24)\?"
+                $Body.tags.configurationHash | Should -Be $w.configurationHash
+                $script:slotNonce=$Body.properties.forceUpdateTag
+            }
+            Mock Get-ArmResource {
+                if($Id -notmatch '/runCommands/'){return @{properties=@{status='Connected'}}}
+                $script:slotReads++
+                $nonce=if($script:slotReads -le 2){'previous'}else{$script:slotNonce}
+                @{properties=@{provisioningState='Succeeded';instanceView=@{
+                    executionState='Succeeded';exitCode=0
+                    output="WORKLOADFLEET_INVOCATION=$nonce`n"+'WORKLOADFLEET_RESULT={"accepted":true}'
+                }}}
+            }
+            (Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(2))).accepted | Should -BeTrue
+            $script:slotReads | Should -Be 3
+            Should -Invoke Invoke-ArmRequest -Times 1
+            Should -Invoke Start-Sleep -Times 1
+        }
+        It 'does not overwrite an active owned command or reuse an unowned slot' {
+            $a=New-FleetFixture
+            $w=(New-ResolvedFixture $a)[0]
+            Mock Invoke-ArmRequest {}
+            Mock Assert-OwnedResource {}
+            Mock Get-ArmResource {
+                if($Id -notmatch '/runCommands/'){return @{properties=@{status='Connected'}}}
+                @{properties=@{provisioningState='Updating';instanceView=@{executionState='Running'}}}
+            }
+            { Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(2)) } | Should -Throw '*active*'
+            Mock Assert-OwnedResource { if($Resource.properties['instanceView']){throw 'Unowned slot'} }
+            { Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(2)) } | Should -Throw '*Unowned*'
+            Should -Invoke Invoke-ArmRequest -Times 0
         }
         It 'batches growing peer fleets while retaining every exact target and no extra VM' {
             $a=New-FleetFixture
