@@ -140,7 +140,7 @@ Describe 'Opt-in fleet convergence' {
             Mock Start-Sleep {}
             Mock Invoke-ArmRequest {
                 $CreateOnly | Should -BeFalse
-                $Path | Should -Match "/runCommands/wlf-$('a' * 24)\?"
+                $Path | Should -Match "/runCommands/wlcf-$('a' * 24)\?"
                 $Body.tags.configurationHash | Should -Be $w.configurationHash
                 $script:slotNonce=$Body.properties.forceUpdateTag
             }
@@ -148,7 +148,7 @@ Describe 'Opt-in fleet convergence' {
                 if($Id -notmatch '/runCommands/'){return @{properties=@{status='Connected'}}}
                 $script:slotReads++
                 $nonce=if($script:slotReads -le 2){'previous'}else{$script:slotNonce}
-                @{properties=@{provisioningState='Succeeded';instanceView=@{
+                @{tags=@{project='azure-local-workload-templates'};properties=@{provisioningState='Succeeded';instanceView=@{
                     executionState='Succeeded';exitCode=0
                     output="WORKLOADFLEET_INVOCATION=$nonce`n"+'WORKLOADFLEET_RESULT={"accepted":true}'
                 }}}
@@ -165,12 +165,72 @@ Describe 'Opt-in fleet convergence' {
             Mock Assert-OwnedResource {}
             Mock Get-ArmResource {
                 if($Id -notmatch '/runCommands/'){return @{properties=@{status='Connected'}}}
-                @{properties=@{provisioningState='Updating';instanceView=@{executionState='Running'}}}
+                @{tags=@{project='azure-local-workload-templates'};properties=@{provisioningState='Updating';instanceView=@{executionState='Running'}}}
             }
             { Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(2)) } | Should -Throw '*active*'
             Mock Assert-OwnedResource { if($Resource.properties['instanceView']){throw 'Unowned slot'} }
             { Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(2)) } | Should -Throw '*Unowned*'
             Should -Invoke Invoke-ArmRequest -Times 0
+        }
+        It 'reuses its completed source-stamped command after all returned tags disappear' {
+            $a=New-FleetFixture
+            $w=(New-ResolvedFixture $a)[0]
+            $script:ownedSlot=$null
+            $script:slotCreates=@()
+            Mock Start-Sleep {}
+            Mock Get-ArmResource {
+                if($Id -notmatch '/runCommands/'){
+                    return @{name=$w.name;tags=@{project='azure-local-workload-templates';deploymentSet=$a.deploymentName;configurationHash=$w.configurationHash};properties=@{status='Connected'}}
+                }
+                $script:ownedSlot
+            }
+            Mock Invoke-ArmRequest {
+                $script:slotCreates+=@([bool]$CreateOnly)
+                $script:ownedSlot=@{properties=@{
+                    source=$Body.properties.source;provisioningState='Succeeded'
+                    instanceView=@{executionState='Succeeded';exitCode=0;output="WORKLOADFLEET_INVOCATION=$($Body.properties.forceUpdateTag)`n"+'WORKLOADFLEET_RESULT={"accepted":true}'}
+                }}
+            }
+            (Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(2))).accepted | Should -BeTrue
+            (Invoke-FleetGuestCommand $a $w 'SECOND SAFE SCRIPT' ([DateTime]::UtcNow.AddMinutes(2))).accepted | Should -BeTrue
+            ($script:slotCreates -join ',') | Should -Be 'True,False'
+            Should -Invoke Invoke-ArmRequest -Times 2
+        }
+        It 'refuses <change> even after previously creating the slot' -ForEach @(
+            @{change='an unmarked source'},
+            @{change='a missing source'},
+            @{change='a foreign source stamp'},
+            @{change='conflicting tags'},
+            @{change='incomplete tags'},
+            @{change='an active stamped command'}
+        ) {
+            $a=New-FleetFixture
+            $w=(New-ResolvedFixture $a)[0]
+            $script:ownedSlot=$null
+            Mock Start-Sleep {}
+            Mock Get-ArmResource {
+                if($Id -notmatch '/runCommands/'){
+                    return @{name=$w.name;tags=@{project='azure-local-workload-templates';deploymentSet=$a.deploymentName;configurationHash=$w.configurationHash};properties=@{status='Connected'}}
+                }
+                $script:ownedSlot
+            }
+            Mock Invoke-ArmRequest {
+                $script:ownedSlot=@{properties=@{
+                    source=$Body.properties.source;provisioningState='Succeeded'
+                    instanceView=@{executionState='Succeeded';exitCode=0;output="WORKLOADFLEET_INVOCATION=$($Body.properties.forceUpdateTag)`n"+'WORKLOADFLEET_RESULT={"accepted":true}'}
+                }}
+            }
+            (Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(2))).accepted | Should -BeTrue
+            switch($change){
+                'an unmarked source' {$script:ownedSlot.properties.source.script=$script:ownedSlot.properties.source.script -replace '^#[^\n]+\n',''}
+                'a missing source' {$script:ownedSlot.properties.Remove('source')}
+                'a foreign source stamp' {$script:ownedSlot.properties.source.script=$script:ownedSlot.properties.source.script -replace '^#[^\n]+\n',"# WORKLOADFLEET_OWNER=foreign`n"}
+                'conflicting tags' {$script:ownedSlot.tags=@{project='azure-local-workload-templates';deploymentSet='another-deployment';configurationHash=$w.configurationHash}}
+                'incomplete tags' {$script:ownedSlot.tags=@{project='azure-local-workload-templates'}}
+                'an active stamped command' {$script:ownedSlot.properties.provisioningState='Updating';$script:ownedSlot.properties.instanceView.executionState='Running'}
+            }
+            { Invoke-FleetGuestCommand $a $w 'MUST NOT EXECUTE' ([DateTime]::UtcNow.AddMinutes(2)) } | Should -Throw
+            Should -Invoke Invoke-ArmRequest -Times 1
         }
         It 'batches growing peer fleets while retaining every exact target and no extra VM' {
             $a=New-FleetFixture

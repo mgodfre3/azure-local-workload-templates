@@ -50,10 +50,23 @@ function Invoke-FleetGuestCommand {
         $null = Get-ConvergenceRemainingSeconds $Deadline
         Start-Sleep -Seconds 10
     } while ($true)
-    $commandId = "$machineId/runCommands/wlf-$($Workload.configurationHash.Substring(0, 24))"
+    $ownership = [ordered]@{
+        project = 'azure-local-workload-templates'
+        deploymentSet = $Answers.deploymentName
+        configurationHash = $Workload.configurationHash
+    }
+    $ownershipStamp = '# WORKLOADFLEET_OWNER=' + [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes(($ownership | ConvertTo-Json -Compress)))
+    $commandId = "$machineId/runCommands/wlcf-$($Workload.configurationHash.Substring(0, 24))"
     $existing = Get-ArmResource $commandId '2024-07-10' -AllowNotFound
     if ($existing) {
-        Assert-OwnedResource $existing $Answers.deploymentName $Workload.configurationHash
+        $existingSource = $existing.properties['source']
+        $hasSourceStamp = $existingSource -and ([string]$existingSource['script']).StartsWith("$ownershipStamp`n", [StringComparison]::Ordinal)
+        if ($existing['tags'] -and $existing.tags.Count -gt 0) {
+            Assert-OwnedResource $existing $Answers.deploymentName $Workload.configurationHash
+        } elseif (!$hasSourceStamp) {
+            throw 'Fleet command has neither ownership tags nor the exact source ownership stamp. Refusing to modify/adopt it.'
+        }
         $existingView = $existing.properties['instanceView']
         if (!$existingView -or $existingView['executionState'] -notin @('Succeeded', 'Failed', 'TimedOut', 'Canceled') -or
             $existing.properties.provisioningState -notin @('Succeeded', 'Failed', 'Canceled', 'Cancelled')) {
@@ -65,10 +78,8 @@ function Invoke-FleetGuestCommand {
     $Script = ($Script -replace "`r`n", "`n").TrimEnd("`n") + "`n"
     $sentinel = if ($Workload.isLinux) { "printf '$marker\n'`n" } else { "'$marker'`n" }
     $timeout = [Math]::Min(900, (Get-ConvergenceRemainingSeconds $Deadline))
-    $request = @{ location = $Answers.location; tags = @{
-        project = 'azure-local-workload-templates'; deploymentSet = $Answers.deploymentName; configurationHash = $Workload.configurationHash
-    }; properties = @{
-        source = @{ script = $sentinel + $Script + $sentinel }; timeoutInSeconds = $timeout
+    $request = @{ location = $Answers.location; tags = $ownership; properties = @{
+        source = @{ script = "$ownershipStamp`n" + $sentinel + $Script + $sentinel }; timeoutInSeconds = $timeout
         asyncExecution = $false; forceUpdateTag = $nonce
     } }
     $null = Invoke-ArmRequest -Method PUT -Path "${commandId}?api-version=2024-07-10" -Body $request -CreateOnly:(!$existing)
