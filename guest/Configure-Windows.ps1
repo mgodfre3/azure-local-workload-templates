@@ -365,6 +365,8 @@ function Set-FileServer($Config, $Admin) {
     $actual = Get-SmbShare -Name $Config.fileServer.shareName
     $access = @(Get-SmbShareAccess -Name $Config.fileServer.shareName)
     if (!$actual.EncryptData -or $access.Count -ne 1 -or $access[0].AccountName -ne $account -or $access[0].AccessRight -ne 'Full') { throw 'SMB verification failed.' }
+    # Share creation can add a separate GUID-named SMB opening after role installation.
+    if ($Config.windowsPreparation.scopeInheritedFirewall -eq $true) { Set-InheritedFirewallScope 445 $Config.allowedCidrs }
     Set-WorkloadFirewall 445 $Config.allowedCidrs
 }
 

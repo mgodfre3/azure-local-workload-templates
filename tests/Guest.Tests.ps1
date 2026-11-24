@@ -188,6 +188,51 @@ Describe 'File server role-created firewall safety' {
         $script:roleRuleEnabled | Should -BeFalse
         Should -Invoke Set-PrivateDirectory -Times 0
     }
+    Context 'Share-created firewall opening' {
+        BeforeAll {
+            function Get-SmbShare { param($Name) }
+            function New-SmbShare { param($Name,$Path,$FullAccess,$EncryptData,$FolderEnumerationMode) }
+            function Get-SmbShareAccess { param($Name) }
+            function Set-SmbServerConfiguration { param($EnableSMB1Protocol,$EnableSMB2Protocol,$RejectUnencryptedAccess,$Confirm) }
+        }
+        BeforeEach {
+            $script:shareCreated=$false
+            $script:shareOpeningBroad=$false
+            $admin=[pscustomobject]@{Name='vmadmin';SID=[pscustomobject]@{Value='S-1-5-21-1'}}
+            Mock Set-PrivateDirectory {}
+            Mock Assert-PrivateTree {}
+            Mock Set-SmbServerConfiguration {}
+            Mock Get-SmbShare {
+                if($script:shareCreated){[pscustomobject]@{Path='E:\Shares\Data';EncryptData=$true}}
+            }
+            Mock New-SmbShare {
+                $script:shareCreated=$true
+                $script:shareOpeningBroad=$true
+            }
+            Mock Get-SmbShareAccess {
+                [pscustomobject]@{AccountName="$env:COMPUTERNAME\vmadmin";AccessRight='Full'}
+            }
+            Mock Set-InheritedFirewallScope { $script:shareOpeningBroad=$false }
+            Mock Set-WorkloadFirewall {
+                if($script:shareOpeningBroad){throw 'Share-created SMB opening remains outside allowedCidrs.'}
+            }
+        }
+        It 'reapplies only the explicit scoping policy after share creation before enabling the workload port' {
+            $config=New-Config
+            $config.windowsPreparation=@{scopeInheritedFirewall=$true}
+            Set-FileServer $config $admin
+            $script:shareCreated | Should -BeTrue
+            $script:shareOpeningBroad | Should -BeFalse
+            Should -Invoke Set-InheritedFirewallScope -Times 1 -Exactly -ParameterFilter {
+                $Port -eq 445 -and $Cidrs.Count -eq 1 -and $Cidrs[0] -eq '192.0.2.0/24'
+            }
+            Should -Invoke Set-WorkloadFirewall -Times 1 -Exactly
+        }
+        It 'does not silently scope a share-created opening without the independent opt-in' {
+            { Set-FileServer (New-Config) $admin } | Should -Throw '*Share-created SMB opening remains outside*'
+            Should -Invoke Set-InheritedFirewallScope -Times 0
+        }
+    }
 }
 
 Describe 'SQL disruptive recovery preconditions' {
