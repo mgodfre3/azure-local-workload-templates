@@ -76,7 +76,7 @@ function Invoke-FleetGuestCommand {
     $nonce = [guid]::NewGuid().ToString('N')
     $marker = "WORKLOADFLEET_INVOCATION=$nonce"
     $Script = ($Script -replace "`r`n", "`n").TrimEnd("`n") + "`n"
-    $sentinel = if ($Workload.isLinux) { "printf '$marker\n'`n" } else { "'$marker'`n" }
+    $sentinel = if ($Workload['isLinux'] -eq $true) { "printf '$marker\n'`n" } else { "'$marker'`n" }
     $timeout = [Math]::Min(900, (Get-ConvergenceRemainingSeconds $Deadline))
     $request = @{ location = $Answers.location; tags = $ownership; properties = @{
         source = @{ script = "$ownershipStamp`n" + $sentinel + $Script + $sentinel }; timeoutInSeconds = $timeout

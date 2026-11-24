@@ -94,6 +94,31 @@ Describe 'Opt-in fleet convergence' {
             $script:commandReads | Should -Be 2
             Should -Invoke Assert-OwnedResource -Times 1
         }
+        It 'handles original Windows preparation workloads without a derived Linux flag under strict mode' {
+            Set-StrictMode -Version Latest
+            $a=New-FleetFixture
+            $w=$a.workloads[0]+@{configurationHash='a'*64}
+            $w.ContainsKey('isLinux') | Should -BeFalse
+            $script:submitted=$false
+            Mock Assert-OwnedResource {}
+            Mock Invoke-ArmRequest {
+                $script:submitted=$true
+                $script:nonce=$Body.properties.forceUpdateTag
+                $Body.properties.source.script | Should -Match "\n'WORKLOADFLEET_INVOCATION="
+                $Body.properties.source.script | Should -Not -Match 'printf'
+            }
+            Mock Get-ArmResource {
+                if($Id -notmatch '/runCommands/'){return @{properties=@{status='Connected'}}}
+                if(!$script:submitted){return $null}
+                @{properties=@{provisioningState='Succeeded';instanceView=@{
+                    executionState='Succeeded';exitCode=0
+                    output="WORKLOADFLEET_INVOCATION=$script:nonce`n"+'WORKLOADFLEET_RESULT={"accepted":true}'
+                }}}
+            }
+            (Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(2))).accepted | Should -BeTrue
+            Should -Invoke Invoke-ArmRequest -Times 1
+            Set-StrictMode -Off
+        }
         It 'waits for a newly submitted command to become readable without resubmitting it' {
             $a = New-FleetFixture
             $w = (New-ResolvedFixture $a)[0]
