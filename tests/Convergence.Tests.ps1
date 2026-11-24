@@ -75,6 +75,8 @@ Describe 'Opt-in fleet convergence' {
             Mock Start-Sleep {}
             Mock Invoke-ArmRequest {
                 (($Path -split '/runCommands/')[1] -split '\?')[0].Length | Should -BeLessOrEqual 36
+                $Body.properties.source.script | Should -Not -Match "`r"
+                $Body.properties.source.script.EndsWith("`n") | Should -BeTrue
             }
             Mock Get-ArmResource {
                 if ($Id -notmatch '/runCommands/') { return @{properties=@{status='Connected'}} }
@@ -84,7 +86,7 @@ Describe 'Opt-in fleet convergence' {
                     exitCode=0;output='WORKLOADFLEET_RESULT={"accepted":true}'
                 }}}
             }
-            (Invoke-FleetGuestCommand $a $w 'NO LIVE EXECUTION' ([DateTime]::UtcNow.AddMinutes(5))).accepted | Should -BeTrue
+            (Invoke-FleetGuestCommand $a $w "NO LIVE`r`nEXECUTION" ([DateTime]::UtcNow.AddMinutes(5))).accepted | Should -BeTrue
             $script:commandReads | Should -Be 2
             Should -Invoke Assert-OwnedResource -Times 1
         }
@@ -181,11 +183,21 @@ Describe 'Opt-in fleet convergence' {
                 $Body.properties.parameters.deployMonitoring.value | Should -BeTrue
                 $script:sequence.Add('services')
             }
+
             Mock Invoke-FleetPeerAcceptance { $script:sequence.Add('peers') }
             Mock Invoke-FleetMonitoringAcceptance { $script:sequence.Add('monitoring') }
             $body = @{ properties = @{ parameters = @{ adminPassword = @{value='unit-test-only'} } } }
             Invoke-FleetConvergence $a $resolved '/deployment' $body 120
             ($script:sequence -join ',') | Should -Be 'wait,prepare,services,wait,peers,monitoring'
+        }
+        It 'requires distinct actual Linux identities before service or monitoring convergence' {
+            $identities = @{}
+            { Assert-FleetLinuxIdentity @{machineIdentitySha256='a' * 64} $identities } | Should -Not -Throw
+            { Assert-FleetLinuxIdentity @{machineIdentitySha256='b' * 64} $identities } | Should -Not -Throw
+            { Assert-FleetLinuxIdentity @{machineIdentitySha256='a' * 64} $identities } | Should -Throw '*duplicate*'
+            foreach ($invalid in @($null, '', ('a' * 32), 'not-a-hash')) {
+                { Assert-FleetLinuxIdentity @{machineIdentitySha256=$invalid} $identities } | Should -Throw '*identity*'
+            }
         }
         It 'rejects non-restart configuration failures even when a different Windows failure is restart eligible' {
             $a = New-FleetFixture

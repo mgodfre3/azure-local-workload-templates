@@ -53,7 +53,7 @@ function Invoke-FleetGuestCommand {
     $commandId = "$machineId/runCommands/wlf-$([guid]::NewGuid().ToString('N'))"
     $timeout = [Math]::Min(900, (Get-ConvergenceRemainingSeconds $Deadline))
     $request = @{ location = $Answers.location; properties = @{
-        source = @{ script = $Script }; timeoutInSeconds = $timeout; asyncExecution = $false
+        source = @{ script = (($Script -replace "`r`n", "`n").TrimEnd("`n") + "`n") }; timeoutInSeconds = $timeout; asyncExecution = $false
     } }
     $null = Invoke-ArmRequest -Method PUT -Path "${commandId}?api-version=2024-07-10" -Body $request -CreateOnly
     do {
@@ -172,6 +172,7 @@ function Invoke-FleetConvergence {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $null = Wait-ArmResource $DeploymentId '2022-09-01' (Get-ConvergenceRemainingSeconds $deadline)
     $restarts = @{}
+    $linuxIdentities = @{}
     foreach ($workload in $Resolved) {
         $restarts[$workload.name] = 0
         $original = $Answers.workloads | Where-Object name -EQ $workload.name
@@ -179,9 +180,11 @@ function Invoke-FleetConvergence {
             $null = Get-CommittedFleetGuest 'validate-linux.sh'
             $null = Get-CommittedFleetGuest 'validate-cloud-init.py'
             $text = Get-LinuxAcceptanceScript $Answers $original
-            $text += "`n" + 'printf ''WORKLOADFLEET_RESULT={"accepted":true}\n'''
+            $text += "`n" + 'identity=$(sha256sum /etc/machine-id | cut -d " " -f 1)' +
+                "`n" + 'printf ''WORKLOADFLEET_RESULT={"accepted":true,"machineIdentitySha256":"%s"}\n'' "$identity"'
             $acceptance = Invoke-FleetGuestCommand $Answers $workload $text $deadline
             if ($acceptance['accepted'] -isnot [bool] -or $acceptance.accepted -ne $true) { throw 'Linux readiness gate did not pass; no application/owned monitoring deployment followed.' }
+            Assert-FleetLinuxIdentity $acceptance $linuxIdentities
         } elseif ($workload.configureGuest) {
             $null = Invoke-FleetWindowsPreparation $Answers ($original + @{ configurationHash = $workload.configurationHash }) $deadline $restarts
         }
@@ -207,6 +210,18 @@ function Invoke-FleetConvergence {
     } while ($true)
     Invoke-FleetPeerAcceptance $Answers $Resolved $Body.properties.parameters.adminPassword $deadline
     Invoke-FleetMonitoringAcceptance $Answers $Resolved $deadline
+}
+
+function Assert-FleetLinuxIdentity {
+    param([hashtable]$Acceptance, [hashtable]$Identities)
+    $identity = $Acceptance['machineIdentitySha256']
+    if ($identity -isnot [string] -or $identity -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Linux readiness lacks a verifiable machine identity; no application/owned monitoring deployment followed.'
+    }
+    if ($Identities.ContainsKey($identity)) {
+        throw 'Linux workloads have duplicate machine identities. Generalize the source image; enrolled identities were not changed.'
+    }
+    $Identities[$identity] = $true
 }
 
 function Get-FleetAddress {
