@@ -501,6 +501,18 @@ function Get-ImagePlan {
     $plan
 }
 
+function Assert-NicDns {
+    param([hashtable]$Nic, [string[]]$DnsServers)
+    if (!$Nic) { return }
+    $existing = @()
+    if ($Nic.properties['dnsSettings']) {
+        $existing = @($Nic.properties.dnsSettings['dnsServers'] | Where-Object { $_ })
+    }
+    if (($existing -join ',') -cne ($DnsServers -join ',')) {
+        throw 'Existing managed NIC DNS differs from the selected logical network. DNS is immutable after NIC creation; explicitly recreate the disposable workload/NIC or retain its original settings. No update was attempted.'
+    }
+}
+
 function Get-ConfigurationHash {
     param([hashtable]$Answers, [hashtable]$Workload, [string]$ImageId)
     # Explicit, ordered inputs avoid hash churn from JSON property order and exclude credentials.
@@ -678,11 +690,7 @@ function Invoke-WorkloadPreflight {
         )) {
             $resource = Get-ArmResource "$rgId/providers/$($entry[0])" $entry[1] -AllowNotFound
             Assert-OwnedResource $resource $Answers.deploymentName $hash
-            if ($resource -and $entry[0] -like 'Microsoft.AzureStackHCI/networkInterfaces/*' -and
-                $resource.properties['dnsSettings'] -and $resource.properties.dnsSettings['dnsServers'] -and
-                (($resource.properties.dnsSettings.dnsServers -join ',') -cne ($dnsServers -join ','))) {
-                throw 'Existing managed NIC DNS differs from the selected logical network; review DNS drift before deployment.'
-            }
+            if ($entry[0] -like 'Microsoft.AzureStackHCI/networkInterfaces/*') { Assert-NicDns $resource $dnsServers }
             if ($null -ne $resource -and $entry[0] -like 'Microsoft.HybridCompute/machines/*') {
                 $existingMachine = $resource
                 $vm = Get-ArmResource "$($resource.id)/providers/Microsoft.AzureStackHCI/virtualMachineInstances/default" -AllowNotFound

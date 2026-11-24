@@ -955,6 +955,17 @@ Describe 'Static addressing, RBAC and bounded polling' {
             { Assert-NetworkConfiguration $script:networkFixture @(Expand-Workloads @($w)) } | Should -Not -Throw
         }
 
+        It 'refuses immutable DNS changes including previously inherited DNS before NIC updates' {
+            { Assert-NicDns $null @('192.0.2.53') } | Should -Not -Throw
+            $nic = @{ properties = @{} }
+            { Assert-NicDns $nic @() } | Should -Not -Throw
+            { Assert-NicDns $nic @('192.0.2.53') } | Should -Throw '*immutable*'
+            $nic.properties.dnsSettings = @{ dnsServers = @('192.0.2.53', '192.0.2.54') }
+            { Assert-NicDns $nic @('192.0.2.53', '192.0.2.54') } | Should -Not -Throw
+            { Assert-NicDns $nic @('192.0.2.54', '192.0.2.53') } | Should -Throw '*immutable*'
+            { Assert-NicDns $nic @() } | Should -Throw '*immutable*'
+        }
+
         It 'rejects static addresses on DHCP networks and detects other NIC allocations' {
             $workload = @{ name = 'files-01'; privateIpAddress = '10.40.0.20' }
             $script:networkFixture.properties.subnets[0].properties.ipAllocationMethod = 'Dynamic'
