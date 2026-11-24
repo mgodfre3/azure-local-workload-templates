@@ -136,6 +136,8 @@ For expressly disposable health probes, separately opt into **`administratorPoli
 
 A newly submitted Arc Run Command can temporarily return not found while its resource propagates. Convergence polls that same command within its existing deadline without resubmitting it or treating absence as success. Authorization and other read errors still fail explicitly.
 
+Windows preparation transports the exact committed guest source as gzip/base64 and decompresses it only in memory, including on Windows PowerShell 5.1. This avoids an oversized inline request without new guest downloads, script blobs, temporary script files or changes to preparation/security checks.
+
 This path is regression-tested automation, not certification of any stamp, image, licensing entitlement, or release. A full live six-profile pass still requires actual guest, service and monitoring acceptance; source generalization and a selected warning policy alone do not establish that result.
 
 Every mode prints total VM count, vCPU, RAM and attached data-disk count/capacity, separately labeling advisory OS-disk capacity and entries without suggestions. CPU/RAM/data disk settings are deployment inputs; `suggestedOsDiskSizeGB` is intentionally **not** a fabricated VM API size override. The pinned stable VM API has no OS-disk size field for image-based creation. Prepare an appropriately sized image or follow a separately reviewed disk/guest-filesystem expansion procedure; this tool does neither. These are starting suggestions, not capacity guarantees or a host reservation; image caches, OS actual size, resiliency, free space and monitoring overhead are additional.

@@ -412,6 +412,34 @@ Describe 'Opt-in fleet convergence' {
             }
             Should -Invoke Invoke-SourceGit -Times 0 -ParameterFilter {$Arguments[0] -eq 'show'}
         }
+        It 'delivers the full committed Windows preparation source losslessly with transport headroom' {
+            $a=New-FleetFixture
+            $w=$a.workloads[0]
+            $command=Get-WindowsPreparationCommand $a $w
+            [Text.Encoding]::UTF8.GetByteCount($command) | Should -BeLessThan 32768
+            $encoded=[regex]::Match($command,"FromBase64String\('([^']+)'\)").Groups[1].Value
+            $memory=[IO.MemoryStream]::new([Convert]::FromBase64String($encoded))
+            $gzip=[IO.Compression.GZipStream]::new($memory,[IO.Compression.CompressionMode]::Decompress)
+            $reader=[IO.StreamReader]::new($gzip,[Text.Encoding]::UTF8)
+            try {$decoded=$reader.ReadToEnd()} finally {$reader.Dispose();$gzip.Dispose();$memory.Dispose()}
+            $decoded | Should -BeExactly (Get-CommittedFleetGuest 'Configure-Windows.ps1')
+            $command | Should -Not -Match 'Invoke-WebRequest|HttpClient|WriteAllText|Set-Content'
+        }
+        It 'decompresses the actual Windows preparation transport under Windows PowerShell 5.1' -Skip:(!$IsWindows) {
+            $a=New-FleetFixture
+            $command=Get-WindowsPreparationCommand $a $a.workloads[0]
+            $boundary=$command.IndexOf('. ([scriptblock]::Create($source))')
+            $boundary | Should -BeGreaterThan 0
+            $decoder=$command.Substring(0,$boundary)+
+                "[Convert]::ToBase64String([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes(`$source)))"
+            $path=Join-Path $TestDrive 'decode-preparation.ps1'
+            $decoder | Set-Content -LiteralPath $path
+            $actual=& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -File $path
+            $LASTEXITCODE | Should -Be 0
+            $expected=[Convert]::ToBase64String([Security.Cryptography.SHA256]::HashData(
+                [Text.Encoding]::UTF8.GetBytes((Get-CommittedFleetGuest 'Configure-Windows.ps1'))))
+            ($actual -join '').Trim() | Should -BeExactly $expected
+        }
         It 'cleans the exact subject after failed certificate issuance and preserves the original failure' {
             $a=New-FleetFixture
             $client=(New-ResolvedFixture $a)[1]

@@ -123,10 +123,19 @@ function Get-CommittedFleetGuest {
 
 function Get-WindowsPreparationCommand {
     param([hashtable]$Answers, [hashtable]$Workload)
-    $guest = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(
-        (Get-CommittedFleetGuest 'Configure-Windows.ps1')))
+    $bytes = [Text.Encoding]::UTF8.GetBytes((Get-CommittedFleetGuest 'Configure-Windows.ps1'))
+    $compressed = [IO.MemoryStream]::new()
+    try {
+        $gzip = [IO.Compression.GZipStream]::new($compressed, [IO.Compression.CompressionLevel]::Optimal, $true)
+        try { $gzip.Write($bytes, 0, $bytes.Length) } finally { $gzip.Dispose() }
+        $guest = [Convert]::ToBase64String($compressed.ToArray())
+    } finally { $compressed.Dispose() }
     $payload = Get-WindowsConfigurationPayload $Answers $Workload
-    "`$ErrorActionPreference='Stop'; . ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$guest')))) -ConfigurationBase64 '$payload'; " +
+    "`$ErrorActionPreference='Stop'; `$compressed=[IO.MemoryStream]::new([Convert]::FromBase64String('$guest')); " +
+        "`$gzip=[IO.Compression.GZipStream]::new(`$compressed,[IO.Compression.CompressionMode]::Decompress); " +
+        "`$reader=[IO.StreamReader]::new(`$gzip,[Text.Encoding]::UTF8); " +
+        "try { `$source=`$reader.ReadToEnd() } finally { `$reader.Dispose(); `$gzip.Dispose(); `$compressed.Dispose() }; " +
+        ". ([scriptblock]::Create(`$source)) -ConfigurationBase64 '$payload'; " +
         "`$result=Invoke-WorkloadPreparation '$payload'; 'WORKLOADFLEET_RESULT='+(`$result|ConvertTo-Json -Compress)"
 }
 
