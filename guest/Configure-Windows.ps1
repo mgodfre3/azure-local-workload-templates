@@ -353,7 +353,19 @@ function Set-FileServer($Config, $Admin) {
     $account = "$env:COMPUTERNAME\$($Admin.Name)"
     Set-SmbServerConfiguration -EnableSMB1Protocol $false -EnableSMB2Protocol $true -RejectUnencryptedAccess $true -Confirm:$false
     if (!$share.Count) {
-        New-SmbShare -Name $Config.fileServer.shareName -Path $path -FullAccess $account -EncryptData $true -FolderEnumerationMode AccessBased | Out-Null
+        $enabledBefore = @(Get-NetFirewallRule -PolicyStore PersistentStore -Enabled True -Direction Inbound -Action Allow |
+            Select-Object -ExpandProperty Name)
+        try {
+            New-SmbShare -Name $Config.fileServer.shareName -Path $path -FullAccess $account -EncryptData $true -FolderEnumerationMode AccessBased | Out-Null
+        } finally {
+            # Close only newly enabled SMB openings, even when share creation fails.
+            Get-NetFirewallRule -PolicyStore PersistentStore -Enabled True -Direction Inbound -Action Allow |
+                Where-Object {
+                    $filter = $_ | Get-NetFirewallPortFilter
+                    $_.Name -notin $enabledBefore -and $filter.Protocol -in @('TCP', '6') -and
+                        @($filter.LocalPort).Count -eq 1 -and "$($filter.LocalPort)" -eq '445'
+                } | Disable-NetFirewallRule | Out-Null
+        }
     } else {
         Set-SmbShare -Name $Config.fileServer.shareName -EncryptData $true -FolderEnumerationMode AccessBased -Force
         foreach ($entry in Get-SmbShareAccess -Name $Config.fileServer.shareName) {
@@ -365,7 +377,6 @@ function Set-FileServer($Config, $Admin) {
     $actual = Get-SmbShare -Name $Config.fileServer.shareName
     $access = @(Get-SmbShareAccess -Name $Config.fileServer.shareName)
     if (!$actual.EncryptData -or $access.Count -ne 1 -or $access[0].AccountName -ne $account -or $access[0].AccessRight -ne 'Full') { throw 'SMB verification failed.' }
-    # Share creation can add a separate GUID-named SMB opening after role installation.
     if ($Config.windowsPreparation.scopeInheritedFirewall -eq $true) { Set-InheritedFirewallScope 445 $Config.allowedCidrs }
     Set-WorkloadFirewall 445 $Config.allowedCidrs
 }

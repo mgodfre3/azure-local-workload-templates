@@ -697,6 +697,12 @@ function Invoke-WorkloadPreflight {
                 Assert-VmMatchesConfiguration $vm $workload $resolved.imageId $rgId
             }
         }
+        $associationId = "$rgId/providers/Microsoft.HybridCompute/machines/$($workload.name)/providers/Microsoft.Insights/dataCollectionRuleAssociations/workload-logs"
+        $association = Get-ArmResource $associationId '2023-03-11' -AllowNotFound
+        $collectionId = "$rgId/providers/Microsoft.Insights/dataCollectionRules/$($workload.name)-collection"
+        if ($association -and $association.properties['dataCollectionRuleId'] -ine $collectionId) {
+            throw 'Existing workload-logs monitoring association targets a different DCR. Refusing to replace an independently managed collection route.'
+        }
         foreach ($diskDefinition in @(Get-WorkloadDisks $workload)) {
             $disk = Get-ArmResource "$rgId/providers/Microsoft.AzureStackHCI/virtualHardDisks/$($workload.name)-$($diskDefinition.role)" -AllowNotFound
             Assert-OwnedResource $disk $Answers.deploymentName $hash

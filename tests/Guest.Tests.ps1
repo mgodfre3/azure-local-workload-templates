@@ -151,7 +151,7 @@ Describe 'Explicit Marketplace SQL administrator convergence' {
 Describe 'File server role-created firewall safety' {
     BeforeAll {
         function Install-WindowsFeature { param($Name) }
-        function Get-NetFirewallRule { param($PolicyStore) }
+        function Get-NetFirewallRule { param($PolicyStore,$Enabled,$Direction,$Action) }
         function Disable-NetFirewallRule { param([Parameter(ValueFromPipeline)]$InputObject) }
     }
     BeforeEach {
@@ -194,6 +194,7 @@ Describe 'File server role-created firewall safety' {
             function New-SmbShare { param($Name,$Path,$FullAccess,$EncryptData,$FolderEnumerationMode) }
             function Get-SmbShareAccess { param($Name) }
             function Set-SmbServerConfiguration { param($EnableSMB1Protocol,$EnableSMB2Protocol,$RejectUnencryptedAccess,$Confirm) }
+            function Get-NetFirewallPortFilter { param([Parameter(ValueFromPipeline)]$InputObject) }
         }
         BeforeEach {
             $script:shareCreated=$false
@@ -208,6 +209,18 @@ Describe 'File server role-created firewall safety' {
             Mock New-SmbShare {
                 $script:shareCreated=$true
                 $script:shareOpeningBroad=$true
+            }
+            Mock Get-NetFirewallRule {
+                [pscustomobject]@{Name='FileServer-ServerManager-SMB-TCP-In'}
+                if ($script:shareOpeningBroad) { [pscustomobject]@{Name='new-share-guid'} }
+                [pscustomobject]@{Name='existing-scoped-rule'}
+            }
+            Mock Get-NetFirewallPortFilter { [pscustomobject]@{Protocol='TCP';LocalPort='445'} }
+            Mock Disable-NetFirewallRule {
+                param($InputObject)
+                if ($InputObject.Name -eq 'new-share-guid') { $script:shareOpeningBroad=$false }
+                elseif ($InputObject.Name -eq 'FileServer-ServerManager-SMB-TCP-In') { $script:roleRuleEnabled=$false }
+                else { throw 'Must not disable a preexisting rule.' }
             }
             Mock Get-SmbShareAccess {
                 [pscustomobject]@{AccountName="$env:COMPUTERNAME\vmadmin";AccessRight='Full'}
@@ -228,9 +241,20 @@ Describe 'File server role-created firewall safety' {
             }
             Should -Invoke Set-WorkloadFirewall -Times 1 -Exactly
         }
-        It 'does not silently scope a share-created opening without the independent opt-in' {
-            { Set-FileServer (New-Config) $admin } | Should -Throw '*Share-created SMB opening remains outside*'
+        It 'closes its new share-created opening without altering inherited rules or requiring a scoping opt-in' {
+            Set-FileServer (New-Config) $admin
+            $script:shareOpeningBroad | Should -BeFalse
             Should -Invoke Set-InheritedFirewallScope -Times 0
+            Should -Invoke Disable-NetFirewallRule -Times 1 -Exactly -ParameterFilter { $InputObject.Name -eq 'new-share-guid' }
+        }
+        It 'closes its new SMB opening when share creation throws after enabling the rule' {
+            Mock New-SmbShare {
+                $script:shareOpeningBroad=$true
+                throw 'Share creation failed.'
+            }
+            { Set-FileServer (New-Config) $admin } | Should -Throw '*Share creation failed*'
+            $script:shareOpeningBroad | Should -BeFalse
+            Should -Invoke Set-WorkloadFirewall -Times 0
         }
     }
 }

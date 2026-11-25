@@ -1014,6 +1014,35 @@ Describe 'Static addressing, RBAC and bounded polling' {
             { Wait-ArmResource '/id' 'api' 0 0 } | Should -Throw '*Timed out*'
         }
 
+        It 'checks the exact association before writes and preserves conflicting collection routes' {
+            $a = New-Answers
+            $script:associationFixture = $null
+            $script:associationCollectionId = "/subscriptions/$($a.subscriptionId)/resourceGroups/$($a.resourceGroup)/providers/Microsoft.Insights/dataCollectionRules/files-01-collection"
+            Mock Invoke-ArmRequest { @{ registrationState='Registered' } }
+            Mock Assert-DeploymentPermissions {}
+            Mock Assert-ReadyResource {}
+            Mock Assert-NetworkConfiguration {}
+            Mock Get-LogicalNetworkDnsServers { @() }
+            Mock Get-ArmCollection { @() }
+            Mock Get-ImagePlan { @(@{workloadName='files-01';imageId='/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-workloads/providers/Microsoft.AzureStackHCI/galleryImages/image';import=$false}) }
+            Mock Get-ArmResource {
+                param($Id,$AllowNotFound)
+                if ($Id -like '*/dataCollectionRuleAssociations/workload-logs') { return $script:associationFixture }
+                if ($AllowNotFound) { return $null }
+                @{ location=$a.location; properties=@{connectivityStatus='Connected'} }
+            }
+            { Invoke-WorkloadPreflight $a } | Should -Not -Throw
+            $script:associationFixture = @{properties=@{dataCollectionRuleId=$script:associationCollectionId.ToUpperInvariant()}}
+            { Invoke-WorkloadPreflight $a } | Should -Not -Throw
+            foreach ($target in @('/independently-managed-rule', '')) {
+                $script:associationFixture = @{properties=@{dataCollectionRuleId=$target}}
+                { Invoke-WorkloadPreflight $a } | Should -Throw '*Refusing to replace*'
+            }
+            Should -Invoke Get-ArmResource -Times 4 -Exactly -ParameterFilter {
+                $Id -eq "/subscriptions/$($a.subscriptionId)/resourceGroups/$($a.resourceGroup)/providers/Microsoft.HybridCompute/machines/files-01/providers/Microsoft.Insights/dataCollectionRuleAssociations/workload-logs" -and $AllowNotFound
+            }
+        }
+
         It 'returns only when readiness is Succeeded' {
             Mock Get-ArmResource { @{ name = 'test'; properties = @{ provisioningState = 'Succeeded' } } }
             (Wait-ArmResource '/id' 'api' 60 0).properties.provisioningState | Should -Be Succeeded
