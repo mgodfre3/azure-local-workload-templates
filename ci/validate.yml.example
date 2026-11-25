@@ -1,0 +1,30 @@
+# Copy to .github/workflows/validate.yml with a workflow-authorized credential.
+name: Offline validation
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  validate:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          Install-PSResource Pester -Version 5.7.1 -Scope CurrentUser -TrustRepository -Quiet
+          python -m pip install -r tests/requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Python test dependency installation failed.' }
+          az bicep install --version v0.42.1
+          if ($LASTEXITCODE -ne 0) { throw 'Bicep installation failed.' }
+      - name: Test and compile (no Azure sign-in)
+        shell: pwsh
+        run: ./scripts/Test.ps1
+      - name: Check shell syntax
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sh -n guest/configure-nginx.sh && sh -n guest/validate-linux.sh

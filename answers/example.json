@@ -1,0 +1,154 @@
+{
+  "$schema": "./schema.json",
+  "schemaVersion": 1,
+  "deploymentName": "branch-office",
+  "namingPrefix": "LAB",
+  "tags": {
+    "Function": "WorkloadFleet",
+    "Created By": "<operator>",
+    "Date Built": "auto"
+  },
+  "subscriptionId": "00000000-0000-0000-0000-000000000000",
+  "resourceGroup": "rg-workloads",
+  "location": "eastus",
+  "stamp": {
+    "clusterResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-stamp/providers/Microsoft.AzureStackHCI/clusters/local-stamp",
+    "customLocationId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-stamp/providers/Microsoft.ExtendedLocation/customLocations/local-location",
+    "mappingConfirmed": true
+  },
+  "logicalNetworkId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-stamp/providers/Microsoft.AzureStackHCI/logicalNetworks/workload-network",
+  "storageContainerId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-stamp/providers/Microsoft.AzureStackHCI/storageContainers/workload-storage",
+  "adminUsername": "workloadadmin",
+  "passwordSource": { "type": "prompt" },
+  "logAnalyticsWorkspaceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-monitor/providers/Microsoft.OperationalInsights/workspaces/workload-logs",
+  "workloads": [
+    {
+      "name": "files",
+      "count": 1,
+      "profile": "fileServer",
+      "processors": 2,
+      "memoryMB": 4096,
+      "suggestedOsDiskSizeGB": 128,
+      "dataDiskSizeGB": 128,
+      "allowedCidrs": ["10.40.0.0/24"],
+      "image": {
+        "source": "marketplace",
+        "os": "WindowsServer2022",
+        "name": "windows-2022-approved",
+        "publisher": "microsoftwindowsserver",
+        "offer": "windowsserver",
+        "sku": "2022-datacenter-azure-edition",
+        "version": "20348.2461.240510",
+        "licenseAndMarketplaceTermsConfirmed": true
+      },
+      "fileServer": { "shareName": "Department" }
+    },
+    {
+      "name": "sql",
+      "count": 0,
+      "profile": "sqlServer",
+      "processors": 4,
+      "memoryMB": 8192,
+      "suggestedOsDiskSizeGB": 128,
+      "dataDiskSizeGB": 128,
+      "allowedCidrs": ["10.40.0.0/24"],
+      "image": {
+        "source": "marketplace",
+        "os": "WindowsServer2022",
+        "name": "windows-2022-approved",
+        "publisher": "microsoftwindowsserver",
+        "offer": "windowsserver",
+        "sku": "2022-datacenter-azure-edition",
+        "version": "20348.2461.240510",
+        "licenseAndMarketplaceTermsConfirmed": true
+      },
+      "sqlServer": {
+        "installerUrl": "https://downloads.example.org/sql-server-2022.iso",
+        "installerSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "edition": "Developer",
+        "acceptLicenseTerms": true,
+        "productionLicenseConfirmed": false
+      }
+    },
+    {
+      "name": "web",
+      "count": 0,
+      "profile": "webServer",
+      "processors": 2,
+      "memoryMB": 2048,
+      "suggestedOsDiskSizeGB": 64,
+      "allowedCidrs": ["10.40.0.0/24"],
+      "sshPublicKey": "ssh-rsa AAAA",
+      "image": {
+        "source": "local",
+        "os": "Ubuntu2404",
+        "name": "ubuntu-2404-prepared",
+        "path": "C:\\ClusterStorage\\Volume1\\Images\\ubuntu-2404-nocloud.vhdx",
+        "stampPathConfirmed": true,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "preparedImageConfirmed": true
+      }
+    },
+    {
+      "name": "iis",
+      "count": 0,
+      "profile": "iisServer",
+      "processors": 2,
+      "memoryMB": 4096,
+      "suggestedOsDiskSizeGB": 128,
+      "dataDiskSizeGB": 64,
+      "allowedCidrs": ["10.40.0.0/24"],
+      "image": {
+        "source": "marketplace",
+        "os": "WindowsServer2022",
+        "name": "windows-2022-approved",
+        "publisher": "microsoftwindowsserver",
+        "offer": "windowsserver",
+        "sku": "2022-datacenter-azure-edition",
+        "version": "20348.2461.240510",
+        "licenseAndMarketplaceTermsConfirmed": true
+      }
+    },
+    {
+      "name": "winapp",
+      "count": 0,
+      "profile": "windowsApp",
+      "processors": 2,
+      "memoryMB": 4096,
+      "suggestedOsDiskSizeGB": 128,
+      "dataDisks": [{ "role": "appdata", "sizeGB": 64 }],
+      "allowedCidrs": ["10.40.0.0/24"],
+      "image": {
+        "source": "marketplace",
+        "os": "WindowsServer2022",
+        "name": "windows-2022-approved",
+        "publisher": "microsoftwindowsserver",
+        "offer": "windowsserver",
+        "sku": "2022-datacenter-azure-edition",
+        "version": "20348.2461.240510",
+        "licenseAndMarketplaceTermsConfirmed": true
+      }
+    },
+    {
+      "name": "linuxapp",
+      "count": 0,
+      "profile": "linuxApp",
+      "processors": 2,
+      "memoryMB": 2048,
+      "suggestedOsDiskSizeGB": 64,
+      "dataDisks": [{ "role": "appdata", "sizeGB": 64 }, { "role": "logs", "sizeGB": 32 }],
+      "allowedCidrs": ["10.40.0.0/24"],
+      "sshPublicKey": "ssh-rsa AAAA",
+      "image": {
+        "source": "blob",
+        "os": "Ubuntu2404",
+        "name": "ubuntu-2404-from-blob",
+        "uri": "https://preparedimages.blob.core.windows.net/images/ubuntu-2404-nocloud.vhd",
+        "sasTokenEnvironmentVariable": "AZLOCAL_IMAGE_READ_SAS",
+        "pageBlobConfirmed": true,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "preparedImageConfirmed": true
+      }
+    }
+  ]
+}
