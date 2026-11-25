@@ -2,7 +2,7 @@
 
 Bicep and PowerShell 7 tooling for deploying **Arc-enabled VMs on an existing Azure Local stamp**. These are `Microsoft.AzureStackHCI` resources scoped to `Microsoft.HybridCompute/machines`, not Azure IaaS VMs.
 
-**Initial release: offline-verified reference implementation with partial pilot evidence, not full live acceptance or production certification.** Start in a disposable lab, review the generated deployment and guest scripts, and verify client connectivity, data protection, licensing, and monitoring before production use.
+**Initial release: offline-verified reference implementation with one successful fresh six-profile, single-command pilot deployment, not repeatability or production certification.** The successful run followed four failed development attempts and required no manual guest recovery. Service/allowed-peer access and exact-resource Heartbeat/log-marker checks passed. Known Linux schema warnings remained under the explicit policy below, the base Windows guest retained a pending-restart flag, and one independent post-run peer recheck failed before an unchanged repeat passed; its cause was not established. Counts greater than one and a reliability SLA have not been live-certified. Start in a disposable lab, review the generated deployment and guest scripts, and verify client connectivity, data protection, licensing, and monitoring before production use.
 
 ## Workloads
 
